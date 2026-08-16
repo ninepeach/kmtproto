@@ -93,6 +93,17 @@ Abort, or an explicit durable-store crash-recovery procedure. A PROCESSING
 record observed without a local owner produces a retryable state and never calls
 the application.
 
+If the application may have committed but the outcome of `Complete` is unknown,
+the SEND is in an **indeterminate commit state**. KMTProto prefers preventing a
+duplicate application execution over automatically reclaiming that claim.
+Elapsed time or ordinary TTL expiry MUST NOT turn unresolved PROCESSING into
+NOT_FOUND. `Abort` is safe only when the caller or store can establish that the
+downstream commit did not occur; otherwise resolution requires `Complete` or an
+explicit store-specific crash-recovery procedure. Applications that require
+end-to-end side-effect deduplication MUST durably persist and honor `msgID` as
+their idempotency key. This is why KMTProto does not claim global exactly-once
+side effects.
+
 Legal SEND message IDs are globally unique (ULID recommended). The store's
 identity is `(session_id, msg_id)` and the message ID is always passed unchanged
 to `ApplicationHandler` as `idempotencyKey`. This is essential for the crash
@@ -243,19 +254,20 @@ This prevents a resumable Session from silently outliving its required dedup or 
 
 1. Every resumable Session has its own EVENT sequence.
 2. Only EVENT changes sequence position.
-3. Sequence is monotonic and never decreases.
+3. Server sequence and client `last_seq` are monotonic and never decrease.
 4. One `(session_id, seq)` always maps to one `event_id`.
-5. Replay preserves original ID, sequence, payload, and timestamp.
-6. One `(session_id, msg_id)` creates at most one logical application submission in the idempotency window.
-7. The SEND message ID reaches the application as its idempotency key.
-8. ACK is sent only after reliable completion is stored.
-9. A gap suspends application delivery until fixed-boundary replay completes.
-10. An old generation never mutates the active connection state.
-11. All connection output passes one serialization point.
-12. No lock spans blocking I/O, storage, application code, or user callbacks.
-13. Heartbeat does not participate in EVENT sequencing.
-14. Timestamps never determine order or deduplication.
-15. Resume begins only after the application-confirmed `last_seq`.
+5. Replay uses a fixed `replay_to` and preserves original ID, sequence, payload, and timestamp.
+6. A COMPLETED duplicate returns the original logical ACK and never calls the application again; one `(session_id, msg_id)` creates at most one logical application submission in the idempotency window.
+7. An unresolved PROCESSING SEND never becomes claimable solely because time or ordinary TTL elapsed; resolution requires `Complete`, a provably safe `Abort`, or explicit store-specific crash recovery.
+8. The SEND message ID reaches the application as its idempotency key.
+9. ACK is sent only after reliable completion is stored.
+10. A gap suspends application delivery until fixed-boundary replay completes; partial replay is never delivered to the application.
+11. An old generation never mutates the active connection state.
+12. All connection output passes one serialization point.
+13. No lock spans blocking I/O, storage, application code, or user callbacks.
+14. Heartbeat does not participate in EVENT sequencing.
+15. Timestamps never determine order or deduplication.
+16. Resume begins only after the application-confirmed `last_seq`.
 
 ## Reliability boundary
 

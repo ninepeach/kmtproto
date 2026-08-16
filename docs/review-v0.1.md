@@ -210,7 +210,7 @@ queue policy remains a caller/runtime concern.
   the application.
 - Replay events retain their original ID, sequence, and payload.
 - Current-generation checks happen before client frame state mutation, so old
-  EVENT, PONG, and ERROR frames cannot change the new client state.
+  WELCOME, EVENT, PONG, and ERROR frames cannot change the new client state.
 - PING/PONG do not consume EVENT sequence and are not replayed.
 - Wire timestamps are not used for correctness decisions.
 - `Codec` remains an interface; the protocol model is not permanently coupled
@@ -229,7 +229,7 @@ global exactly-once transactions, message routing, authentication, Message
 Center, BigCC, NLX, UI, groups, uploads, receipts, typing indicators, encryption,
 multi-device synchronization, and cluster coordination.
 
-## Planned minimal hardening
+## Implemented minimal hardening
 
 1. Preserve active PROCESSING claims and close the local flight-registration
    window.
@@ -276,22 +276,35 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 
 ## Resolution record
 
-| Finding | Status before hardening | Resolution/test |
+| Finding | Final status | Resolution/test |
 | --- | --- | --- |
-| C-1 | Open | Resolved: PROCESSING survives TTL; `TestProcessingDedupClaimDoesNotExpire` |
-| H-1 | Open | Resolved: flight precedes Claim; `TestDuplicateBindsToFlightBeforeClaim` |
-| H-2 | Open | Resolved: event/byte replay limits and bounded identity window; `TestClientReplayLimitsDoNotAdvanceSequence`, `TestEventIdentityWindowIsBoundedAndConservative` |
-| H-3 | Open | Resolved: generation-fenced `ServerConnection` admission state; `TestServerConnectionAdmissionState`, `TestServerConnectionReplacementFencesLateHandshake` |
-| H-4 | Open | Resolved: separate sequence high-water and exhaustion guard; `TestReplayHighWaterSurvivesFullPrune` |
-| H-5 | Open | Resolved: explicit RESUMED boundary encoding/presence validation; `TestResumedWelcomeCarriesExplicitBounds` |
-| M-1 | Open | Resolved: PONG requires READY/SUSPECT; `TestInvalidClientStateTransitionsAndOldWelcome` |
-| M-2 | Open | Resolved: `BehaviorForErrorCode`; `TestErrorBehaviorAndRetryabilityValidation` |
-| M-3 | Open | Resolved: no permanent lane worker and panic recovery; `TestStreamLaneRecoversFromPanic` |
-| M-4 | Open | Resolved: complete outbound validation precedes client mutation; `TestOutboundValidationPrecedesClientMutation` |
-| M-5 | Open | Resolved: invariant and failure-window suite in `hardening_test.go` |
-| M-6 | Open | Resolved: `ServerConfig.MaxReplayEvents`; `TestServerReplayEventLimitReturnsSyncRequired` |
-| L-1 | Open/documentation | Documented: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServer` derives it from that clock |
-| L-2 | Open/documentation | Documented: helper queues/outbox are process-local; replay-specific memory is bounded |
+| C-1 | Resolved | PROCESSING survives TTL; `TestProcessingDedupClaimDoesNotExpire` |
+| H-1 | Resolved | Flight precedes Claim; `TestDuplicateBindsToFlightBeforeClaim` |
+| H-2 | Resolved | Event/byte replay limits and bounded identity window; `TestClientReplayLimitsDoNotAdvanceSequence`, `TestEventIdentityWindowIsBoundedAndConservative` |
+| H-3 | Resolved | Generation-fenced `ServerConnection` admission state; `TestServerConnectionAdmissionState`, `TestServerConnectionReplacementFencesLateHandshake` |
+| H-4 | Resolved | Separate sequence high-water and exhaustion guard; `TestReplayHighWaterSurvivesFullPrune` |
+| H-5 | Resolved | Explicit RESUMED boundary encoding/presence validation; `TestResumedWelcomeCarriesExplicitBounds` |
+| M-1 | Resolved | PONG requires READY/SUSPECT; `TestInvalidClientStateTransitionsAndOldWelcome` |
+| M-2 | Resolved | `BehaviorForErrorCode`; `TestErrorBehaviorAndRetryabilityValidation` |
+| M-3 | Resolved | No permanent lane worker and panic recovery; `TestStreamLaneRecoversFromPanic` |
+| M-4 | Resolved | Complete outbound validation precedes client mutation; `TestOutboundValidationPrecedesClientMutation` |
+| M-5 | Resolved | Invariant and failure-window suite in `hardening_test.go` |
+| M-6 | Resolved | `ServerConfig.MaxReplayEvents`; `TestServerReplayEventLimitReturnsSyncRequired` |
+| L-1 | Accepted | Documented compatibility behavior: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServer` derives it from that clock |
+| L-2 | Accepted / Out of Scope | Helper queues/outbox are documented as process-local; replay-specific memory is bounded, while production backpressure and persistence belong to the runtime |
+
+- Remaining Critical findings: **0**
+- Remaining High findings: **0**
+
+## Final public API assessment
+
+The hardening is additive at the Go API level: replay-limit configuration,
+error disposition, and reference `ServerConnection` state were added without
+removing frame types, exported method signatures, or application/store
+interfaces. The stricter RESUMED WELCOME representation, forbidden envelope
+IDs, fixed ERROR retryability, and `ServerConnection` admission checks are
+intentional v0.1 wire/state correctness tightenings. Their migration impact is
+listed in Compatibility notes above.
 
 ## Final verification
 
@@ -302,7 +315,7 @@ gofmt -w .                                      PASS
 go vet ./...                                    PASS
 go test ./...                                   PASS
 go test -race ./...                             PASS
-go test -fuzz=FuzzJSONCodec -fuzztime=10s .     PASS (99,024 executions)
+go test -run=^$ -fuzz=FuzzJSONCodec -fuzztime=10s .  PASS (bounded 10-second run)
 ```
 
 No real network, wall-clock sleep, scheduler-timing assertion, database,
