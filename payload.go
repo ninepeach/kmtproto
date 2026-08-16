@@ -18,6 +18,23 @@ type WelcomePayload struct {
 	ReplayTo   uint64 `json:"replay_to,omitempty"`
 }
 
+// MarshalJSON keeps RESUMED replay boundaries explicit on the wire, including
+// a zero replay_to value for an empty event stream.
+func (p WelcomePayload) MarshalJSON() ([]byte, error) {
+	if p.Mode == WelcomeModeResumed {
+		return json.Marshal(struct {
+			Mode       string `json:"mode"`
+			ServerTime int64  `json:"server_time"`
+			ResumeFrom uint64 `json:"resume_from"`
+			ReplayTo   uint64 `json:"replay_to"`
+		}{p.Mode, p.ServerTime, p.ResumeFrom, p.ReplayTo})
+	}
+	return json.Marshal(struct {
+		Mode       string `json:"mode"`
+		ServerTime int64  `json:"server_time"`
+	}{p.Mode, p.ServerTime})
+}
+
 type PingPayload struct {
 	PingID     string `json:"ping_id"`
 	ClientTime int64  `json:"client_time"`
