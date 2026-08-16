@@ -26,16 +26,20 @@ The fixed v0.1 frame set is `HELLO`, `WELCOME`, `PING`, `PONG`, `SEND`, `ACK`, `
 
 ## Frame matrix
 
-| Frame | Direction | Required identity | Sequence | Replayable |
-|---|---|---|---:|---|
-| `HELLO` | Client → Server | none | 0 | no |
-| `WELCOME` | Server → Client | `session_id` | 0 | no |
-| `PING` / `PONG` | both | `session_id`, payload `ping_id` | 0 | no |
-| `SEND` | Client → Server | `session_id`, `id` | 0 | no |
-| `ACK` | Server → Client | `session_id`, payload `ref_id` | 0 | no |
-| `EVENT` | Server → Client | `session_id`, `id` | ≥ 1 | yes |
-| `RESUME` | Client → Server | `session_id`, payload `last_seq` | 0 | no |
-| `ERROR` | Server → Client | payload `code` | 0 | no |
+| Frame | Required | Optional | Forbidden/fixed | Receiver state | Success response/effect |
+|---|---|---|---|---|---|
+| `HELLO` | valid payload | envelope `id`, client name | empty `session_id`, `seq=0` | server awaiting handshake | `WELCOME(NEW)` |
+| `WELCOME` | `session_id`, valid mode | timestamp | envelope `id`, `seq=0`; NEW has no replay bounds; RESUMED carries both bounds | client HANDSHAKING for NEW or RESUMING for RESUMED | READY immediately for NEW; READY only at replay boundary for RESUMED |
+| `PING` | `session_id`, payload `ping_id` | client timestamp metadata | envelope `id`, `seq=0` | ready server session | matching `PONG` |
+| `PONG` | `session_id`, payload `ping_id` | client/server timestamp metadata | envelope `id`, `seq=0` | client READY or SUSPECT | clears only the matching generation's outstanding ping |
+| `SEND` | globally unique envelope `id`, `session_id`, content | timestamp | `seq=0` | ready server session | stored `ACK` after reliable commit |
+| `ACK` | `session_id`, payload `ref_id` | timestamp | envelope `id`, `seq=0` | client READY or SUSPECT | removes matching pending SEND |
+| `EVENT` | envelope `id`, `session_id`, `seq>=1`, content | event type, timestamp | gaps are not deliverable | client READY or expected replay position in RESUMING | ordered delivery, or buffered fixed replay |
+| `RESUME` | `session_id`, payload `last_seq` | timestamp | envelope `id`, `seq=0` | server awaiting handshake | `WELCOME(RESUMED)` then fixed replay |
+| `ERROR` | standard payload code and retryable flag | `session_id`, payload message/ref ID, timestamp | envelope `id`, `seq=0` | any active state | code-specific disposition; never ERROR-about-ERROR |
+
+Only `EVENT` is replayable. `WELCOME`, `PING`, `PONG`, `SEND`, `ACK`,
+`RESUME`, and `ERROR` never enter the EVENT stream.
 
 Envelope and protocol payloads are strictly decoded by default. `SEND.content` and `EVENT.content` are application-owned JSON and remain semantically opaque.
 
@@ -47,6 +51,33 @@ Every newly established transport increments `ConnectionGeneration`. Incoming wo
 
 Client states are `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `HANDSHAKING`, `RESUMING`, `READY`, and `SUSPECT`. Unknown numeric enum values stringify as `UNKNOWN` and never panic.
 
+The client transition causes are fixed:
+
+| From | Input/command | To |
+|---|---|---|
+| DISCONNECTED | `BeginConnect` | CONNECTING |
+| CONNECTING | caller confirms transport connected for current generation | CONNECTED |
+| CONNECTED | `StartSession` | HANDSHAKING |
+| CONNECTED | `Resume` with an existing Session | RESUMING |
+| HANDSHAKING | valid `WELCOME(NEW)` | READY |
+| READY | heartbeat timeout | SUSPECT |
+| SUSPECT | matching current-generation `PONG` | READY |
+| SUSPECT | disconnect grace expires | DISCONNECTED |
+| READY | EVENT gap | RESUMING |
+| RESUMING | complete fixed replay | READY |
+| any active state | caller disconnect, fatal ERROR, or replay safety limit | DISCONNECTED |
+
+Other state/frame combinations return a deterministic protocol/state error; they
+are not silently accepted. `ServerConnection` is the optional reference
+server-side admission gate: each replacement begins in `AWAITING_HANDSHAKE`, a
+successful HELLO or RESUME enters `READY`, and a fatal violation enters
+`CLOSED`.
+
+Generation fencing is a caller/protocol contract. The caller labels incoming
+work with the generation returned for that transport. Given that label, old
+WELCOME, EVENT, PONG, ERROR, or late server-handler completion cannot mutate the
+replacement connection's state. KMTProto does not own or replace transports.
+
 ## SEND, ACK, and idempotency
 
 `SEND` is a reliable logical submission. The client first stores the complete frame in its outbox, sends it, and removes it only after a correlated `ACK`. A timeout retries the exact same frame and message ID.
@@ -55,7 +86,17 @@ Client states are `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `HANDSHAKING`, `RES
 
 The server atomically changes a missing dedup record to `PROCESSING` via `Claim`. Only the winner may call the application. `Complete` stores the logical ACK; a completed duplicate returns that stored ACK. A processing duplicate waits for the in-process winner where possible and never starts a second application call.
 
-The message ID is always passed to `ApplicationHandler` as `idempotencyKey`. This is essential for the crash window:
+The local in-flight record is installed before `Claim`, closing the
+Claim/register race for concurrent requests in one process. A PROCESSING record
+must not expire while its owner is executing; it remains claimed until Complete,
+Abort, or an explicit durable-store crash-recovery procedure. A PROCESSING
+record observed without a local owner produces a retryable state and never calls
+the application.
+
+Legal SEND message IDs are globally unique (ULID recommended). The store's
+identity is `(session_id, msg_id)` and the message ID is always passed unchanged
+to `ApplicationHandler` as `idempotencyKey`. This is essential for the crash
+window:
 
 ```text
 application commit → gateway crash → dedup Complete not stored → client retry
@@ -72,6 +113,7 @@ Each Session owns one ordered EVENT stream. `(session_id, seq)` is an ordered po
 - `incoming == last_seq + 1`: accept and deliver.
 - `incoming <= last_seq`, same event ID: safe duplicate; ignore.
 - `incoming <= last_seq`, different event ID: protocol violation.
+- `incoming <= last_seq`, identity older than the configured verification window: reject conservatively as a protocol violation.
 - `incoming > last_seq + 1`: gap; enter `RESUMING`, stop delivery, and send `RESUME(last_seq)`.
 
 v0.1 intentionally has no out-of-order buffer.
@@ -100,11 +142,22 @@ The resume acknowledgement contains both boundaries:
 
 The client buffers replay frames internally and does not emit any `DeliverEventAction` until every event through `replay_to` is present. A disconnect during partial replay therefore resumes again from the last position already delivered to the application.
 
+`ClientConfig.MaxReplayEvents` and `MaxReplayBytes` bound retained replay before
+any delivery. Exceeding either bound stops automatic resume, leaves `last_seq`
+unchanged, requests full sync, and closes that protocol connection. The recent
+`seq -> event_id` verification map is bounded by `EventIdentityWindow`; an older
+duplicate is rejected rather than accepted without proof. `ServerConfig` also
+limits the number of events in a replay result before loading the slice.
+
 If the requested range predates retained replay data, the server returns non-retryable `SYNC_REQUIRED`. Full synchronization is intentionally outside v0.1. An expired Session returns `INVALID_SESSION`.
 
 ## Stream concurrency
 
-Every Session has a serial stream actor. Resume snapshot/storage work and live event append work pass through that owner, so storage I/O is serialized without holding a mutex. Replay and live output therefore cannot interleave.
+Every Session has a serial reference lane. Resume snapshot/storage work and live
+event append work pass through that lane, so storage I/O is serialized without
+holding a mutex. Replay and live output therefore cannot interleave. The helper
+does not start a permanent per-session goroutine; a recovered callback panic
+fails that operation without stranding later lane work.
 
 All frames for a connection enter one `OutboundQueue`. `EnqueueBatch` is atomic with respect to other enqueues, and one `SingleWriter` is the only component allowed to call the byte sender. No protocol-state mutex is held while application code, storage, network I/O, or a user callback runs.
 
@@ -116,21 +169,63 @@ An outstanding ping records ID, monotonic send time, and connection generation. 
 
 Timeouts use local duration arithmetic, not wire timestamps or `server_time - client_time`.
 
+Tests that replace `ServerConfig.Clock` should also set `NewSessionID` to a
+deterministic generator, or set it to nil so `NewServer` derives the default
+generator from the configured clock. This keeps ID generation deterministic
+without changing the public default configuration behavior.
+
 ## Error behavior
 
-Standard codes are `BAD_REQUEST`, `UNSUPPORTED_VERSION`, `UNAUTHORIZED`, `INVALID_SESSION`, `NOT_FOUND`, `RATE_LIMITED`, `SYNC_REQUIRED`, `INTERNAL`, and `PROTOCOL_VIOLATION`.
+| Code | Retryable | Connection | Session/client effect |
+|---|---:|---|---|
+| `BAD_REQUEST` | false | remains open | reject referenced operation |
+| `UNSUPPORTED_VERSION` | false | close | no v0.1 continuation |
+| `UNAUTHORIZED` | false | close | authorization is caller-owned |
+| `INVALID_SESSION` | false | may remain open | abandon failed resume Session |
+| `NOT_FOUND` | false | remains open | reject referenced operation |
+| `RATE_LIMITED` | true | remains open | caller may retry according to policy |
+| `SYNC_REQUIRED` | false | remains open at wire level | stop automatic resume; full sync required |
+| `INTERNAL` | explicit per failure | implementation policy, currently open | retry only when payload says so |
+| `PROTOCOL_VIOLATION` | false | close | terminate the invalid protocol connection |
 
-- `BAD_REQUEST`, `RATE_LIMITED`: connection may remain open.
-- `UNSUPPORTED_VERSION`, `PROTOCOL_VIOLATION`: emit ERROR when possible, then close.
-- `INVALID_SESSION` during resume: abandon the Session.
-- `SYNC_REQUIRED`: stop automatic resume and notify the application.
-- `INTERNAL`: implementation policy; retryability is explicit.
+`BehaviorForErrorCode` is the executable policy table. Validation rejects a
+fixed code carrying a contradictory retryable flag.
 
 An invalid incoming `ERROR` is never answered with another ERROR; it is ignored or closes the connection to prevent an error loop.
 
 ## Limits
 
-The codec checks `MaxFrameSize` before JSON decoding and validates `MaxPayloadSize`, `MaxIDLength`, `MaxSessionIDLength`, and `MaxErrorMessageLength`. Production deployments should tune these values and add transport-level read limits as the first defensive boundary.
+The codec checks `MaxFrameSize` before JSON decoding and validates
+`MaxPayloadSize`, `MaxIDLength`, `MaxSessionIDLength`, and
+`MaxErrorMessageLength`. Client action builders validate the complete JSON frame
+before mutating outbox, heartbeat, or handshake state. Replay retention is
+separately bounded by event count, retained bytes, and identity window.
+Production deployments should tune these values and add transport-level read
+limits as the first defensive boundary.
+
+## Core and reference-helper boundary
+
+Wire frames, validation, state transitions, generation fencing, sequence/gap
+rules, reliable SEND/ACK semantics, idempotency interfaces, replay boundaries,
+heartbeat, errors, and actions are protocol core.
+
+| Object | Concurrent use | Role and limitation |
+|---|---|---|
+| `Client` | safe | serializes transitions; caller executes returned actions |
+| `Server` | safe if injected interfaces honor their contracts | frame processor; no transport ownership |
+| `MemoryDedupStore` | safe | process-local reference; completed ACK TTL, no durable recovery |
+| `MemoryReplayStore` | safe | process-local reference; caller chooses pruning/persistence |
+| `MemorySessionRepository` | safe | process-local reference only |
+| `OutboundQueue` | safe | unbounded reference FIFO; production backpressure is caller policy |
+| `ServerConnection` | safe | reference admission/generation gate, not a registry or lifecycle manager |
+| `JSONCodec` | safe if configuration is immutable during use | bounded v0.1 wire codec |
+| `SingleWriter` | one active `Run`; queue may have concurrent producers | reference single serialization point |
+| `FakeClock` | safe | deterministic tests only |
+
+No protocol lock is held across storage, application callbacks, byte sender I/O,
+or caller callbacks. Production connection pools, bounded transport queues,
+persistence, cluster ownership, and distributed coordination remain outside the
+protocol library.
 
 ## TTL constraints
 

@@ -247,10 +247,26 @@ frame types, transport ownership, storage infrastructure, or business behavior.
 
 ## Compatibility notes
 
-The intended API changes are additive configuration fields and exported helper
-state/policy types. Existing frame types and application/store interfaces remain
-unchanged. Validation of WELCOME resume-field presence becomes stricter; this is
-a wire-correctness tightening for v0.1 rather than a new protocol feature.
+The implemented API changes are additive configuration fields and exported
+helper state/policy types. Existing frame types and application/store interfaces
+remain unchanged. Validation of WELCOME resume-field presence and envelope-ID
+absence becomes stricter; this is a wire-correctness tightening for v0.1 rather
+than a new protocol feature.
+
+Migration details:
+
+- Zero-valued new replay configuration fields select documented defaults, so
+  existing `ClientConfig` and `ServerConfig` construction continues to work.
+- Callers using `ServerConnection` must complete HELLO or RESUME before passing
+  PING/SEND. Callers that intentionally provide their own admission state may
+  continue to use the lower-level `Server.HandleIncoming` frame processor.
+- RESUMED WELCOME encoders must include both `resume_from` and `replay_to`, even
+  when `replay_to` is zero. NEW WELCOME must omit both fields.
+- Only HELLO may carry an optional envelope ID among non-reliable frames. PING,
+  PONG, WELCOME, ACK, RESUME, and ERROR use their typed payload correlation
+  fields and reject an envelope ID.
+- Standard ERROR codes with fixed retryability now reject a contradictory
+  `retryable` flag. INTERNAL remains explicitly selectable per failure.
 
 The server continues to pass `msgID` to `ApplicationHandler` as the idempotency
 key. Legal SEND IDs are required to be globally unique (ULID recommended), while
@@ -262,11 +278,32 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 
 | Finding | Status before hardening | Resolution/test |
 | --- | --- | --- |
-| C-1 | Open | Pending |
-| H-1 | Open | Pending |
-| H-2 | Open | Pending |
-| H-3 | Open | Pending |
-| H-4 | Open | Pending |
-| H-5 | Open | Pending |
-| M-1 through M-6 | Open | Pending |
-| L-1 through L-2 | Open/documentation | Pending |
+| C-1 | Open | Resolved: PROCESSING survives TTL; `TestProcessingDedupClaimDoesNotExpire` |
+| H-1 | Open | Resolved: flight precedes Claim; `TestDuplicateBindsToFlightBeforeClaim` |
+| H-2 | Open | Resolved: event/byte replay limits and bounded identity window; `TestClientReplayLimitsDoNotAdvanceSequence`, `TestEventIdentityWindowIsBoundedAndConservative` |
+| H-3 | Open | Resolved: generation-fenced `ServerConnection` admission state; `TestServerConnectionAdmissionState`, `TestServerConnectionReplacementFencesLateHandshake` |
+| H-4 | Open | Resolved: separate sequence high-water and exhaustion guard; `TestReplayHighWaterSurvivesFullPrune` |
+| H-5 | Open | Resolved: explicit RESUMED boundary encoding/presence validation; `TestResumedWelcomeCarriesExplicitBounds` |
+| M-1 | Open | Resolved: PONG requires READY/SUSPECT; `TestInvalidClientStateTransitionsAndOldWelcome` |
+| M-2 | Open | Resolved: `BehaviorForErrorCode`; `TestErrorBehaviorAndRetryabilityValidation` |
+| M-3 | Open | Resolved: no permanent lane worker and panic recovery; `TestStreamLaneRecoversFromPanic` |
+| M-4 | Open | Resolved: complete outbound validation precedes client mutation; `TestOutboundValidationPrecedesClientMutation` |
+| M-5 | Open | Resolved: invariant and failure-window suite in `hardening_test.go` |
+| M-6 | Open | Resolved: `ServerConfig.MaxReplayEvents`; `TestServerReplayEventLimitReturnsSyncRequired` |
+| L-1 | Open/documentation | Documented: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServer` derives it from that clock |
+| L-2 | Open/documentation | Documented: helper queues/outbox are process-local; replay-specific memory is bounded |
+
+## Final verification
+
+The hardened tree completed all required checks with Go 1.22:
+
+```text
+gofmt -w .                                      PASS
+go vet ./...                                    PASS
+go test ./...                                   PASS
+go test -race ./...                             PASS
+go test -fuzz=FuzzJSONCodec -fuzztime=10s .     PASS (99,024 executions)
+```
+
+No real network, wall-clock sleep, scheduler-timing assertion, database,
+WebSocket runtime, or business dependency was added.
