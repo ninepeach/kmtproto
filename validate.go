@@ -45,6 +45,12 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		}
 		return nil
 	}
+	noEnvelopeID := func() error {
+		if e.ID != "" {
+			return NewProtocolError(ErrorBadRequest, string(e.Type)+" must not carry envelope id")
+		}
+		return nil
+	}
 	validContent := func(raw json.RawMessage) error {
 		if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || !json.Valid(raw) {
 			return NewProtocolError(ErrorBadRequest, "content must contain one valid JSON value")
@@ -66,6 +72,9 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if err := zeroSeq(); err != nil {
 			return err
 		}
+		if err := noEnvelopeID(); err != nil {
+			return err
+		}
 		var p WelcomePayload
 		if err := decodePayload(e.Payload, &p, strict); err != nil {
 			return err
@@ -73,11 +82,19 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if p.Mode != WelcomeModeNew && p.Mode != WelcomeModeResumed {
 			return NewProtocolError(ErrorBadRequest, "invalid WELCOME mode")
 		}
-		if p.Mode == WelcomeModeNew && (p.ResumeFrom != 0 || p.ReplayTo != 0) {
+		hasResumeFrom, err := jsonFieldPresent(e.Payload, "resume_from")
+		if err != nil {
+			return err
+		}
+		hasReplayTo, err := jsonFieldPresent(e.Payload, "replay_to")
+		if err != nil {
+			return err
+		}
+		if p.Mode == WelcomeModeNew && (hasResumeFrom || hasReplayTo) {
 			return NewProtocolError(ErrorBadRequest, "NEW WELCOME must not carry replay bounds")
 		}
-		if p.Mode == WelcomeModeResumed && p.ResumeFrom == 0 {
-			return NewProtocolError(ErrorBadRequest, "RESUMED WELCOME requires resume_from")
+		if p.Mode == WelcomeModeResumed && (!hasResumeFrom || !hasReplayTo || p.ResumeFrom == 0) {
+			return NewProtocolError(ErrorBadRequest, "RESUMED WELCOME requires explicit replay bounds")
 		}
 		if p.Mode == WelcomeModeResumed && p.ReplayTo+1 < p.ResumeFrom {
 			return NewProtocolError(ErrorBadRequest, "invalid replay bounds")
@@ -88,6 +105,9 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 			return err
 		}
 		if err := zeroSeq(); err != nil {
+			return err
+		}
+		if err := noEnvelopeID(); err != nil {
 			return err
 		}
 		var p PingPayload
@@ -103,6 +123,9 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 			return err
 		}
 		if err := zeroSeq(); err != nil {
+			return err
+		}
+		if err := noEnvelopeID(); err != nil {
 			return err
 		}
 		var p PongPayload
@@ -135,11 +158,14 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if err := zeroSeq(); err != nil {
 			return err
 		}
+		if err := noEnvelopeID(); err != nil {
+			return err
+		}
 		var p AckPayload
 		if err := decodePayload(e.Payload, &p, strict); err != nil {
 			return err
 		}
-		if p.RefID == "" || len(p.RefID) > limits.MaxIDLength {
+		if p.RefID == "" || len(p.RefID) > limits.MaxIDLength || !utf8.ValidString(p.RefID) {
 			return NewProtocolError(ErrorBadRequest, "ACK requires a valid ref_id")
 		}
 		return nil
@@ -162,10 +188,16 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if err := zeroSeq(); err != nil {
 			return err
 		}
+		if err := noEnvelopeID(); err != nil {
+			return err
+		}
 		var p ResumePayload
 		return decodePayload(e.Payload, &p, strict)
 	case FrameError:
 		if err := zeroSeq(); err != nil {
+			return err
+		}
+		if err := noEnvelopeID(); err != nil {
 			return err
 		}
 		var p ErrorPayload
@@ -175,8 +207,12 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if p.Code == "" || len(p.Message) > limits.MaxErrorMessageLength {
 			return NewProtocolError(ErrorBadRequest, "ERROR requires code and bounded message")
 		}
-		if !knownErrorCode(p.Code) {
+		behavior, known := BehaviorForErrorCode(p.Code)
+		if !known {
 			return NewProtocolError(ErrorBadRequest, "unknown ERROR code")
+		}
+		if behavior.RetryabilityFixed && p.Retryable != behavior.Retryable {
+			return NewProtocolError(ErrorBadRequest, "ERROR retryable flag conflicts with code")
 		}
 		if len(p.RefID) > limits.MaxIDLength || !utf8.ValidString(p.RefID) {
 			return NewProtocolError(ErrorBadRequest, "ERROR carries an invalid ref_id")
@@ -187,12 +223,30 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 	}
 }
 
-func knownErrorCode(code string) bool {
-	switch code {
-	case ErrorBadRequest, ErrorUnsupportedVersion, ErrorUnauthorized, ErrorInvalidSession,
-		ErrorNotFound, ErrorRateLimited, ErrorSyncRequired, ErrorInternal, ErrorProtocolViolation:
-		return true
-	default:
-		return false
+func validateOutboundFrame(e *Envelope, limits Limits, strict bool) error {
+	if err := ValidateFrame(e, limits, strict); err != nil {
+		return err
 	}
+	encoded, err := json.Marshal(e)
+	if err != nil {
+		return NewProtocolError(ErrorBadRequest, "frame cannot be encoded: "+err.Error())
+	}
+	if len(encoded) > limits.MaxFrameSize {
+		return NewProtocolError(ErrorBadRequest, "frame exceeds maximum size")
+	}
+	return nil
+}
+
+func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false, NewProtocolError(ErrorBadRequest, "invalid payload: "+err.Error())
+	}
+	_, ok := fields[field]
+	return ok, nil
+}
+
+func knownErrorCode(code string) bool {
+	_, ok := BehaviorForErrorCode(code)
+	return ok
 }

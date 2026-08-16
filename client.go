@@ -8,20 +8,26 @@ import (
 )
 
 type ClientConfig struct {
-	Clock            Clock
-	Limits           Limits
-	HeartbeatTimeout time.Duration
-	DisconnectGrace  time.Duration
-	StrictValidation bool
+	Clock               Clock
+	Limits              Limits
+	HeartbeatTimeout    time.Duration
+	DisconnectGrace     time.Duration
+	StrictValidation    bool
+	MaxReplayEvents     uint64
+	MaxReplayBytes      int
+	EventIdentityWindow uint64
 }
 
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
-		Clock:            RealClock{},
-		Limits:           DefaultLimits(),
-		HeartbeatTimeout: 20 * time.Second,
-		DisconnectGrace:  10 * time.Second,
-		StrictValidation: true,
+		Clock:               RealClock{},
+		Limits:              DefaultLimits(),
+		HeartbeatTimeout:    20 * time.Second,
+		DisconnectGrace:     10 * time.Second,
+		StrictValidation:    true,
+		MaxReplayEvents:     DefaultMaxReplayEvents,
+		MaxReplayBytes:      DefaultMaxReplayBytes,
+		EventIdentityWindow: DefaultEventIdentityWindow,
 	}
 }
 
@@ -31,6 +37,9 @@ type PendingPing struct {
 	Generation ConnectionGeneration
 }
 
+// Client is a concurrency-safe protocol state machine. It does not execute the
+// actions it returns and never calls application or transport code while
+// holding its state lock.
 type Client struct {
 	mu sync.Mutex
 
@@ -46,8 +55,12 @@ type Client struct {
 
 	replayTo     uint64
 	replayBuffer []Envelope
+	replayBytes  int
 }
 
+// NewClient creates a client protocol state machine. Client methods are safe
+// for concurrent use. They never perform network I/O or invoke user callbacks;
+// callers execute the returned actions after each transition completes.
 func NewClient(config ClientConfig) (*Client, error) {
 	if config.Clock == nil {
 		config.Clock = RealClock{}
@@ -55,8 +68,20 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.Limits.MaxFrameSize == 0 {
 		config.Limits = DefaultLimits()
 	}
+	if config.MaxReplayEvents == 0 {
+		config.MaxReplayEvents = DefaultMaxReplayEvents
+	}
+	if config.MaxReplayBytes == 0 {
+		config.MaxReplayBytes = DefaultMaxReplayBytes
+	}
+	if config.EventIdentityWindow == 0 {
+		config.EventIdentityWindow = DefaultEventIdentityWindow
+	}
 	if config.HeartbeatTimeout <= 0 || config.DisconnectGrace <= 0 {
 		return nil, fmt.Errorf("kmtproto: heartbeat durations must be positive")
+	}
+	if config.MaxReplayBytes < 0 {
+		return nil, fmt.Errorf("kmtproto: replay byte limit must be positive")
 	}
 	return &Client{config: config, state: StateDisconnected, eventIDs: make(map[uint64]string), outbox: make(map[string]Envelope)}, nil
 }
@@ -94,6 +119,7 @@ func (c *Client) BeginConnect() ConnectionGeneration {
 	c.suspectAt = time.Time{}
 	c.replayBuffer = nil
 	c.replayTo = 0
+	c.replayBytes = 0
 	return c.generation
 }
 
@@ -119,8 +145,11 @@ func (c *Client) StartSession(generation ConnectionGeneration, clientName string
 	if c.state != StateConnected || c.sessionID != "" {
 		return nil, ErrInvalidState
 	}
-	c.state = StateHandshaking
 	frame := Envelope{V: WireVersionV1, Type: FrameHello, Payload: mustPayload(HelloPayload{ClientName: clientName})}
+	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
+		return nil, err
+	}
+	c.state = StateHandshaking
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
@@ -133,10 +162,15 @@ func (c *Client) Resume(generation ConnectionGeneration) ([]Action, error) {
 	if c.state != StateConnected || c.sessionID == "" {
 		return nil, ErrInvalidState
 	}
+	frame := c.resumeFrameLocked()
+	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
+		return nil, err
+	}
 	c.state = StateResuming
 	c.replayBuffer = nil
 	c.replayTo = 0
-	return []Action{SendFrameAction{Frame: c.resumeFrameLocked()}}, nil
+	c.replayBytes = 0
+	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
 func (c *Client) Disconnect(generation ConnectionGeneration) error {
@@ -149,6 +183,7 @@ func (c *Client) Disconnect(generation ConnectionGeneration) error {
 	c.pendingPing = nil
 	c.replayBuffer = nil
 	c.replayTo = 0
+	c.replayBytes = 0
 	return nil
 }
 
@@ -168,6 +203,9 @@ func (c *Client) EnqueueSend(messageID string, content json.RawMessage) ([]Actio
 		return nil, NewProtocolError(ErrorProtocolViolation, "duplicate local message id")
 	}
 	frame := Envelope{V: WireVersionV1, Type: FrameSend, ID: messageID, SessionID: c.sessionID, Timestamp: c.config.Clock.Now().UnixMilli(), Payload: mustPayload(SendPayload{Content: append([]byte(nil), content...)})}
+	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
+		return nil, err
+	}
 	c.outbox[messageID] = copyEnvelope(frame)
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
@@ -200,8 +238,11 @@ func (c *Client) SendPing(generation ConnectionGeneration, pingID string) ([]Act
 		return nil, ErrInvalidState
 	}
 	now := c.config.Clock.Now()
-	c.pendingPing = &PendingPing{ID: pingID, SentAt: now, Generation: generation}
 	frame := Envelope{V: WireVersionV1, Type: FramePing, SessionID: c.sessionID, Timestamp: now.UnixMilli(), Payload: mustPayload(PingPayload{PingID: pingID, ClientTime: now.UnixMilli()})}
+	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
+		return nil, err
+	}
+	c.pendingPing = &PendingPing{ID: pingID, SentAt: now, Generation: generation}
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
@@ -280,6 +321,10 @@ func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 		}
 		c.replayTo = payload.ReplayTo
 		c.replayBuffer = nil
+		c.replayBytes = 0
+		if c.replayTo-c.lastSeq > c.config.MaxReplayEvents {
+			return c.stopReplayLocked("replay exceeds configured event limit"), nil
+		}
 		if c.replayTo == c.lastSeq {
 			c.state = StateReady
 			return []Action{SessionReadyAction{SessionID: c.sessionID}}, nil
@@ -291,6 +336,9 @@ func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 }
 
 func (c *Client) handlePongLocked(generation ConnectionGeneration, frame Envelope) ([]Action, error) {
+	if c.state != StateReady && c.state != StateSuspect {
+		return nil, ErrInvalidState
+	}
 	var payload PongPayload
 	if err := decodePayload(frame.Payload, &payload, c.config.StrictValidation); err != nil {
 		return nil, err
@@ -326,8 +374,12 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 		return nil, ErrInvalidState
 	}
 	if frame.Seq <= c.lastSeq {
-		if c.eventIDs[frame.Seq] == frame.ID {
+		knownID, known := c.eventIDs[frame.Seq]
+		if known && knownID == frame.ID {
 			return nil, nil
+		}
+		if !known {
+			return nil, ErrIdentityExpired
 		}
 		return nil, ErrProtocolConflict
 	}
@@ -339,18 +391,24 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 		if frame.Seq != expected || frame.Seq > c.replayTo {
 			return nil, NewProtocolError(ErrorProtocolViolation, "invalid replay sequence")
 		}
+		frameBytes := replayEventBytes(frame)
+		if uint64(len(c.replayBuffer))+1 > c.config.MaxReplayEvents || frameBytes > c.config.MaxReplayBytes-c.replayBytes {
+			return c.stopReplayLocked("replay exceeds configured memory limit"), nil
+		}
 		c.replayBuffer = append(c.replayBuffer, copyEnvelope(frame))
+		c.replayBytes += frameBytes
 		if frame.Seq != c.replayTo {
 			return nil, nil
 		}
 		actions := make([]Action, 0, len(c.replayBuffer)+1)
 		for _, event := range c.replayBuffer {
 			c.lastSeq = event.Seq
-			c.eventIDs[event.Seq] = event.ID
+			c.rememberEventLocked(event.Seq, event.ID)
 			actions = append(actions, DeliverEventAction{Event: copyEnvelope(event)})
 		}
 		c.replayBuffer = nil
 		c.replayTo = 0
+		c.replayBytes = 0
 		c.state = StateReady
 		actions = append(actions, SessionReadyAction{SessionID: c.sessionID})
 		return actions, nil
@@ -360,10 +418,11 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 		c.state = StateResuming
 		c.replayBuffer = nil
 		c.replayTo = 0
+		c.replayBytes = 0
 		return []Action{SendFrameAction{Frame: c.resumeFrameLocked()}}, nil
 	}
 	c.lastSeq = frame.Seq
-	c.eventIDs[frame.Seq] = frame.ID
+	c.rememberEventLocked(frame.Seq, frame.ID)
 	return []Action{DeliverEventAction{Event: copyEnvelope(frame)}}, nil
 }
 
@@ -375,18 +434,25 @@ func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
 		return []Action{CloseConnectionAction{Reason: "invalid ERROR frame"}}, nil
 	}
 	actions := []Action{ProtocolErrorAction{Error: payload}}
-	if c.state == StateResuming && payload.Code == ErrorSyncRequired {
+	behavior, _ := BehaviorForErrorCode(payload.Code)
+	if c.state == StateResuming && behavior.FullSyncRequired {
 		c.state = StateDisconnected
+		c.replayBuffer = nil
+		c.replayTo = 0
+		c.replayBytes = 0
 		actions = append(actions, FullSyncRequiredAction{SessionID: c.sessionID})
 	}
-	if c.state == StateResuming && payload.Code == ErrorInvalidSession {
+	if c.state == StateResuming && behavior.AbandonSession {
 		c.state = StateDisconnected
 		c.sessionID = ""
 		c.lastSeq = 0
 		c.eventIDs = make(map[uint64]string)
 		c.outbox = make(map[string]Envelope)
+		c.replayBuffer = nil
+		c.replayTo = 0
+		c.replayBytes = 0
 	}
-	if payload.Code == ErrorUnsupportedVersion || payload.Code == ErrorProtocolViolation {
+	if behavior.CloseConnection {
 		c.state = StateDisconnected
 		actions = append(actions, CloseConnectionAction{Reason: payload.Code})
 	}
@@ -395,6 +461,30 @@ func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
 
 func (c *Client) resumeFrameLocked() Envelope {
 	return Envelope{V: WireVersionV1, Type: FrameResume, SessionID: c.sessionID, Timestamp: c.config.Clock.Now().UnixMilli(), Payload: mustPayload(ResumePayload{LastSeq: c.lastSeq})}
+}
+
+func (c *Client) rememberEventLocked(seq uint64, eventID string) {
+	c.eventIDs[seq] = eventID
+	if seq > c.config.EventIdentityWindow {
+		delete(c.eventIDs, seq-c.config.EventIdentityWindow)
+	}
+}
+
+func (c *Client) stopReplayLocked(reason string) []Action {
+	c.state = StateDisconnected
+	c.pendingPing = nil
+	c.replayBuffer = nil
+	c.replayTo = 0
+	c.replayBytes = 0
+	return []Action{
+		ProtocolErrorAction{Error: ErrorPayload{Code: ErrorSyncRequired, Message: reason, Retryable: false}},
+		FullSyncRequiredAction{SessionID: c.sessionID},
+		CloseConnectionAction{Reason: reason},
+	}
+}
+
+func replayEventBytes(frame Envelope) int {
+	return len(frame.ID) + len(frame.SessionID) + len(frame.Payload) + 32
 }
 
 func sortStrings(values []string) {

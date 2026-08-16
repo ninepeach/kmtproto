@@ -1,5 +1,11 @@
 package kmtproto
 
+const (
+	DefaultMaxReplayEvents     uint64 = 4096
+	DefaultMaxReplayBytes             = 16 << 20
+	DefaultEventIdentityWindow        = 4096
+)
+
 type Limits struct {
 	MaxFrameSize          int
 	MaxPayloadSize        int

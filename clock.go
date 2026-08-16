@@ -13,11 +13,13 @@ type RealClock struct{}
 
 func (RealClock) Now() time.Time { return time.Now() }
 
+// FakeClock is a concurrency-safe deterministic test clock.
 type FakeClock struct {
 	mu  sync.Mutex
 	now time.Time
 }
 
+// NewFakeClock creates a deterministic clock that is safe for concurrent use.
 func NewFakeClock(now time.Time) *FakeClock { return &FakeClock{now: now} }
 
 func (c *FakeClock) Now() time.Time {

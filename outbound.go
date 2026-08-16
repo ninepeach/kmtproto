@@ -8,6 +8,7 @@ import (
 
 var ErrOutboundClosed = errors.New("kmtproto: outbound queue closed")
 
+// OutboundQueue is a concurrency-safe, process-local reference FIFO.
 type OutboundQueue struct {
 	mu     sync.Mutex
 	wake   chan struct{}
@@ -15,6 +16,9 @@ type OutboundQueue struct {
 	closed bool
 }
 
+// NewOutboundQueue creates a process-local, concurrency-safe FIFO. The queue is
+// intentionally unbounded and is a reference integration helper; production
+// backpressure policy belongs to the caller's runtime.
 func NewOutboundQueue() *OutboundQueue {
 	return &OutboundQueue{wake: make(chan struct{}, 1)}
 }
@@ -77,12 +81,15 @@ type ByteSender interface {
 	Send([]byte) error
 }
 
+// SingleWriter serializes one queue to one byte sender.
 type SingleWriter struct {
 	Queue  *OutboundQueue
 	Codec  Codec
 	Sender ByteSender
 }
 
+// Run drains Queue and invokes Sender serially. Exactly one Run call may be
+// active for a SingleWriter; Queue itself may have concurrent producers.
 func (w *SingleWriter) Run(ctx context.Context) error {
 	if w.Queue == nil || w.Codec == nil || w.Sender == nil {
 		return errors.New("kmtproto: incomplete writer configuration")

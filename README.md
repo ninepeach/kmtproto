@@ -81,7 +81,7 @@ type ApplicationHandler interface {
 }
 ```
 
-The protocol store and application idempotency must work together. If the application commits and the gateway crashes before `Complete`, a retry can cross that window; the application must suppress the repeated side effect using the same key.
+SEND IDs must be globally unique (ULID is recommended). The protocol store uses `(session_id, msg_id)` for isolation and passes `msg_id` unchanged to the application. The protocol store and application idempotency must work together. If the application commits and the gateway crashes before `Complete`, a retry can cross that window; the application must suppress the repeated side effect using the same key.
 
 ## Example
 
@@ -108,11 +108,17 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 - `types.go`, `payload.go`: wire envelope, frame types, and typed payloads
 - `json_codec.go`, `validate.go`, `limits.go`: bounded strict codec and validation
 - `client.go`: generation-fenced client state machine, outbox, heartbeat, and replay delivery
-- `server.go`: handshake, idempotent SEND, replay boundary, and per-session stream actor
+- `server.go`: handshake, idempotent SEND, replay boundary, and per-session serial lane
 - `store.go`: required storage interfaces and deterministic in-memory implementations
 - `outbound.go`: atomic frame batches and single writer
 - `action.go`: transport- and application-facing effects
 - `examples/basic`: end-to-end protocol demonstration
+
+`MemoryDedupStore`, `MemoryReplayStore`, `MemorySessionRepository`,
+`OutboundQueue`, `SingleWriter`, and `ServerConnection` are reference helpers
+for tests, examples, and simple integrations. They do not make transport,
+backpressure, persistence, or distributed-session policy part of the wire
+protocol. See the [v0.1 review](docs/review-v0.1.md) for the hardening record.
 
 ## License
 
