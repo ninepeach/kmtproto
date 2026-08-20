@@ -2,11 +2,11 @@
 
 KMTProto is a lightweight, transport-independent protocol core for building reliable real-time chat and messaging systems in Go.
 
-It provides resumable logical sessions, idempotent `SEND`/`ACK`, ordered server-to-client `EVENT` streams, gap detection, bounded replay, application-level heartbeat, connection-generation fencing, strict validation, and a single outbound serialization point—without coupling the protocol to WebSocket, TCP, QUIC, storage, or business logic.
+It provides resumable logical sessions, idempotent `SEND`/`ACK`, ordered server-to-client `EVENT` streams, gap detection, bounded replay, application-level heartbeat, capability negotiation, generic State synchronization, connection-generation fencing, and strict validation—without coupling the protocol to WebSocket, TCP, QUIC, storage, or business logic.
 
-> Status: protocol and implementation version `v0.1` are under active development. The wire format is not yet declared stable for production interoperability.
+> Status: `v0.2` is the current freeze candidate and uses Wire Version 2 as its single baseline.
 
-## What v0.1 guarantees
+## What v0.2 guarantees
 
 - Reliable connection-level `SEND` retry using the same message ID
 - Atomic server-side duplicate claim and completed-ACK replay
@@ -20,8 +20,12 @@ It provides resumable logical sessions, idempotent `SEND`/`ACK`, ordered server-
 - Strict JSON envelope and protocol-payload validation with bounded input sizes
 - Single-writer outbound ordering and replay/live-event serialization
 - Deterministic fake-clock and in-memory test components
+- Immutable HELLO/WELCOME capability negotiation
+- Business-blind State Objects with object-scoped monotonic versions
+- Capability-gated `STATE_QUERY`, `STATE_SNAPSHOT`, and `STATE_UPDATE`
+- Optional Resume State synchronization after fixed-boundary EVENT Replay
 
-KMTProto does **not** claim global exactly-once delivery, process-crash-safe client outbox recovery, cross-service exactly-once side effects, or permanent offline synchronization. See [Protocol v0.1](docs/protocol-v0.1.md) for the exact reliability boundary.
+KMTProto does **not** claim global exactly-once delivery, process-crash-safe client outbox recovery, cross-service exactly-once side effects, permanent offline synchronization, business conflict resolution, or distributed storage safety. See the normative [Protocol v0.2](docs/protocol-v0.2.md) for the exact boundary. [Protocol v0.1](docs/protocol-v0.1.md) remains historical.
 
 ## Install
 
@@ -105,7 +109,9 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 
 ## Package map
 
-- `types.go`, `payload.go`: wire envelope, frame types, and typed payloads
+- `types.go`, `payload.go`: Wire Version 2 envelope, frame types, and typed payloads
+- `capability.go`: capability validation, negotiation, and immutable Session state
+- `state.go`: State Object validation and deterministic version merge
 - `json_codec.go`, `validate.go`, `limits.go`: bounded strict codec and validation
 - `client.go`: generation-fenced client state machine, outbox, heartbeat, and replay delivery
 - `server.go`: handshake, idempotent SEND, replay boundary, and per-session serial lane
@@ -118,7 +124,7 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 `OutboundQueue`, `SingleWriter`, and `ServerConnection` are reference helpers
 for tests, examples, and simple integrations. They do not make transport,
 backpressure, persistence, or distributed-session policy part of the wire
-protocol. See the [v0.1 review](docs/review-v0.1.md) for the hardening record.
+protocol. See the [v0.2 final review](docs/review-v0.2-final.md) for the freeze record.
 
 ## License
 

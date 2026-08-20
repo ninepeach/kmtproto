@@ -71,7 +71,7 @@ func newTestServer(t *testing.T, app ApplicationHandler) (*Server, *FakeClock, *
 func createTestSession(t *testing.T, server *Server) {
 	t.Helper()
 	out := NewOutboundQueue()
-	hello := Envelope{V: WireVersionV1, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
+	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 	if err := server.HandleIncoming(context.Background(), hello, out); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestHelloPingAndUnsupportedVersion(t *testing.T) {
 	server, clock, _ := newTestServer(t, &recordingApp{})
 	createTestSession(t, server)
 	out := NewOutboundQueue()
-	ping := Envelope{V: WireVersionV1, Type: FramePing, SessionID: "s_1", Payload: mustPayload(PingPayload{PingID: "p_1", ClientTime: clock.Now().UnixMilli()})}
+	ping := Envelope{V: WireVersionV2, Type: FramePing, SessionID: "s_1", Payload: mustPayload(PingPayload{PingID: "p_1", ClientTime: clock.Now().UnixMilli()})}
 	if err := server.HandleIncoming(context.Background(), ping, out); err != nil {
 		t.Fatal(err)
 	}
@@ -109,11 +109,36 @@ func TestHelloPingAndUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestWireVersionV2IsTheOnlyAcceptedBaseline(t *testing.T) {
+	v2 := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
+	if err := ValidateFrame(&v2, DefaultLimits(), true); err != nil {
+		t.Fatalf("wire v2 HELLO rejected: %v", err)
+	}
+	v1 := copyEnvelope(v2)
+	v1.V = 1
+	err := ValidateFrame(&v1, DefaultLimits(), true)
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) || protocolErr.Code != ErrorUnsupportedVersion || !protocolErr.Close {
+		t.Fatalf("wire v1 rejection = %#v, want closing UNSUPPORTED_VERSION", err)
+	}
+
+	server, _, _ := newTestServer(t, &recordingApp{})
+	outbound := NewOutboundQueue()
+	if err := server.HandleIncoming(context.Background(), v1, outbound); err != nil {
+		t.Fatal(err)
+	}
+	response := nextTestFrame(t, outbound)
+	var payload ErrorPayload
+	if response.V != WireVersionV2 || response.Type != FrameError || decodePayload(response.Payload, &payload, true) != nil || payload.Code != ErrorUnsupportedVersion {
+		t.Fatalf("wire v1 server response = %#v payload=%#v", response, payload)
+	}
+}
+
 func TestConcurrentDuplicateSendCommitsOnceAndReplaysAck(t *testing.T) {
 	app := &recordingApp{started: make(chan struct{}), release: make(chan struct{})}
 	server, _, _ := newTestServer(t, app)
 	createTestSession(t, server)
-	send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "msg_1", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{"text":"hi"}`)})}
+	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_1", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{"text":"hi"}`)})}
 	out1 := NewOutboundQueue()
 	out2 := NewOutboundQueue()
 	errCh := make(chan error, 2)
@@ -153,7 +178,7 @@ func TestResumeBoundaryAndReplayIdentity(t *testing.T) {
 	}
 	original := nextTestFrame(t, live)
 	resumeOut := NewOutboundQueue()
-	resume := Envelope{V: WireVersionV1, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
 	if err := server.HandleIncoming(context.Background(), resume, resumeOut); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +211,7 @@ func TestSyncRequiredOutsideReplayWindow(t *testing.T) {
 		_ = nextTestFrame(t, out)
 	}
 	replay.PruneBefore("s_1", 3)
-	resume := Envelope{V: WireVersionV1, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
 	if err := server.HandleIncoming(context.Background(), resume, out); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +230,7 @@ func TestServerConnectionRejectsOldGeneration(t *testing.T) {
 	if newGeneration <= oldGeneration {
 		t.Fatal("generation did not advance")
 	}
-	hello := Envelope{V: WireVersionV1, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
+	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 	if err := connection.Handle(context.Background(), server, oldGeneration, hello); !errors.Is(err, ErrStaleConnection) {
 		t.Fatalf("got %v, want stale generation", err)
 	}
@@ -214,7 +239,7 @@ func TestServerConnectionRejectsOldGeneration(t *testing.T) {
 func TestResumeInvalidSession(t *testing.T) {
 	server, _, _ := newTestServer(t, &recordingApp{})
 	out := NewOutboundQueue()
-	resume := Envelope{V: WireVersionV1, Type: FrameResume, SessionID: "missing", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "missing", Payload: mustPayload(ResumePayload{LastSeq: 0})}
 	if err := server.HandleIncoming(context.Background(), resume, out); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +263,7 @@ func TestFailureAfterCompleteRecoversByAckReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	createTestSession(t, server)
-	send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "msg_crash", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_crash", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 	if err := server.HandleIncoming(context.Background(), send, NewOutboundQueue()); err == nil {
 		t.Fatal("expected injected post-complete failure")
 	}

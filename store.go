@@ -12,7 +12,23 @@ import (
 )
 
 var ErrReplayUnavailable = errors.New("kmtproto: replay range unavailable")
+var ErrReplayLimitExceeded = errors.New("kmtproto: replay range exceeds configured limits")
 var ErrSequenceExhausted = errors.New("kmtproto: event sequence exhausted")
+var ErrStateSnapshotLimitExceeded = errors.New("kmtproto: State snapshot exceeds configured limits")
+
+// ReplayLimits are hard safety ceilings applied by ReplayStore before it
+// materializes a replay result. MaxBytes counts encoded EVENT Envelopes.
+type ReplayLimits struct {
+	MaxEvents uint64
+	MaxBytes  int
+}
+
+// StateSnapshotLimits are hard safety ceilings applied by a snapshot provider
+// while it constructs a result. MaxBytes counts the encoded snapshot payload.
+type StateSnapshotLimits struct {
+	MaxObjects int
+	MaxBytes   int
+}
 
 // ServerSessionStore implementations must be safe for concurrent use.
 // Claim is atomic for (sessionID, msgID). Once it returns claimed=true, no
@@ -24,16 +40,57 @@ type ServerSessionStore interface {
 	Abort(sessionID, msgID string) error
 }
 
-type SessionRepository interface {
-	Create(sessionID string, expiresAt time.Time) error
-	Exists(sessionID string, now time.Time) (bool, error)
+// SessionState is protocol metadata retained for one resumable Session.
+// Capabilities are an immutable negotiated snapshot, not application state.
+type SessionState struct {
+	SessionID    string
+	ExpiresAt    time.Time
+	Capabilities SessionCapabilities
 }
 
-// ReplayStore implementations must be safe for concurrent use and must return
-// original EVENT envelopes in strictly contiguous sequence order.
+// CapabilityEnabled reports whether this logical Session has the named
+// protocol capability enabled.
+func (s SessionState) CapabilityEnabled(name string) bool {
+	return s.Capabilities.Enabled(name)
+}
+
+// CapabilityVersion returns the capability version enabled for this Session.
+func (s SessionState) CapabilityVersion(name string) (uint16, bool) {
+	return s.Capabilities.Version(name)
+}
+
+// SessionRepository implementations must be safe for concurrent use. The
+// interface describes process-local protocol semantics only; implementations
+// decide their own persistence and distributed-safety guarantees.
+type SessionRepository interface {
+	Create(state SessionState) error
+	Lookup(sessionID string, now time.Time) (state SessionState, exists bool, err error)
+}
+
+// StateStore is the protocol-facing atomic State contract. Implementations
+// must be safe for concurrent use, return defensive StateObject copies, and
+// atomically enforce ApplyStateObject semantics per identity. The interface
+// does not imply persistence, database transactions, or multi-process safety.
+type StateStore interface {
+	Get(ctx context.Context, namespace, objectID string) (object StateObject, found bool, err error)
+	Apply(ctx context.Context, incoming StateObject) (committed StateObject, result StateApplyResult, err error)
+}
+
+// StateSnapshotProvider returns one authoritative, internally consistent
+// process-local protocol snapshot for the requested namespaces. It must enforce
+// limits while materializing the result, be safe for concurrent use, and return
+// defensive StateObject copies. Storage, persistence, and distributed snapshot
+// coordination are caller concerns.
+type StateSnapshotProvider interface {
+	Snapshot(ctx context.Context, namespaces []string, limits StateSnapshotLimits) ([]StateObject, error)
+}
+
+// ReplayStore implementations must enforce limits while materializing a result,
+// be safe for concurrent use, and return original EVENT envelopes in strictly
+// contiguous sequence order.
 type ReplayStore interface {
 	CurrentSeq(sessionID string) (uint64, error)
-	Replay(sessionID string, afterSeq, throughSeq uint64) ([]Envelope, error)
+	Replay(sessionID string, afterSeq, throughSeq uint64, limits ReplayLimits) ([]Envelope, error)
 }
 
 type EventAppender interface {
@@ -119,27 +176,33 @@ func (s *MemoryDedupStore) Abort(sessionID, msgID string) error {
 // MemorySessionRepository is safe for concurrent use.
 type MemorySessionRepository struct {
 	mu       sync.RWMutex
-	sessions map[string]time.Time
+	sessions map[string]SessionState
 }
 
 // NewMemorySessionRepository returns a process-local repository that is safe
 // for concurrent use.
 func NewMemorySessionRepository() *MemorySessionRepository {
-	return &MemorySessionRepository{sessions: make(map[string]time.Time)}
+	return &MemorySessionRepository{sessions: make(map[string]SessionState)}
 }
 
-func (s *MemorySessionRepository) Create(sessionID string, expiresAt time.Time) error {
+func (s *MemorySessionRepository) Create(state SessionState) error {
+	if state.SessionID == "" || state.ExpiresAt.IsZero() {
+		return errors.New("kmtproto: invalid session state")
+	}
 	s.mu.Lock()
-	s.sessions[sessionID] = expiresAt
+	s.sessions[state.SessionID] = state
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *MemorySessionRepository) Exists(sessionID string, now time.Time) (bool, error) {
+func (s *MemorySessionRepository) Lookup(sessionID string, now time.Time) (SessionState, bool, error) {
 	s.mu.RLock()
-	expiresAt, ok := s.sessions[sessionID]
+	state, ok := s.sessions[sessionID]
 	s.mu.RUnlock()
-	return ok && now.Before(expiresAt), nil
+	if !ok || !now.Before(state.ExpiresAt) {
+		return SessionState{}, false, nil
+	}
+	return state, true, nil
 }
 
 // MemoryReplayStore is a concurrency-safe, process-local reference store.
@@ -169,15 +232,30 @@ func (s *MemoryReplayStore) CurrentSeq(sessionID string) (uint64, error) {
 	return s.current[sessionID], nil
 }
 
-func (s *MemoryReplayStore) Replay(sessionID string, afterSeq, throughSeq uint64) ([]Envelope, error) {
+func (s *MemoryReplayStore) Replay(sessionID string, afterSeq, throughSeq uint64, limits ReplayLimits) ([]Envelope, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if limits.MaxEvents == 0 || limits.MaxBytes <= 0 || throughSeq < afterSeq {
+		return nil, ErrReplayLimitExceeded
+	}
+	if throughSeq-afterSeq > limits.MaxEvents {
+		return nil, ErrReplayLimitExceeded
+	}
 	if floor := s.floor[sessionID]; floor > 0 && afterSeq < floor-1 {
 		return nil, ErrReplayUnavailable
 	}
 	var out []Envelope
+	totalBytes := 0
 	for _, event := range s.events[sessionID] {
 		if event.Seq > afterSeq && event.Seq <= throughSeq {
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				return nil, fmt.Errorf("kmtproto: encode replay event: %w", err)
+			}
+			if len(encoded) > limits.MaxBytes-totalBytes {
+				return nil, ErrReplayLimitExceeded
+			}
+			totalBytes += len(encoded)
 			out = append(out, copyEnvelope(event))
 		}
 	}
@@ -207,7 +285,7 @@ func (s *MemoryReplayStore) Append(sessionID, eventID, eventType string, content
 	if err != nil {
 		return Envelope{}, fmt.Errorf("kmtproto: encode event payload: %w", err)
 	}
-	event := Envelope{V: WireVersionV1, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: seq, Timestamp: timestamp, Payload: payload}
+	event := Envelope{V: WireVersionV2, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: seq, Timestamp: timestamp, Payload: payload}
 	s.events[sessionID] = append(s.events[sessionID], event)
 	s.current[sessionID] = seq
 	s.ids[sessionID][eventID] = struct{}{}

@@ -7,13 +7,13 @@ import (
 	"io"
 )
 
-// JSONCodec implements the bounded v0.1 JSON wire codec.
+// JSONCodec implements the bounded JSON wire codec.
 type JSONCodec struct {
 	Limits Limits
 	Strict bool
 }
 
-// NewJSONCodec returns the v0.1 JSON codec. Encode and Decode are safe for
+// NewJSONCodec returns the JSON codec. Encode and Decode are safe for
 // concurrent use provided Limits and Strict are not mutated concurrently.
 func NewJSONCodec() *JSONCodec {
 	return &JSONCodec{Limits: DefaultLimits(), Strict: true}
@@ -58,10 +58,7 @@ func (c *JSONCodec) Decode(data []byte) (*Envelope, error) {
 }
 
 func (c *JSONCodec) limits() Limits {
-	if c.Limits.MaxFrameSize == 0 {
-		return DefaultLimits()
-	}
-	return c.Limits
+	return normalizeLimits(c.Limits)
 }
 
 func decodePayload(raw json.RawMessage, dst any, strict bool) error {

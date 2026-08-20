@@ -1,13 +1,12 @@
 # KMTProto v0.2 State Synchronization Extension — Design Proposal
 
-Status: **PROPOSAL / NOT IMPLEMENTED**  
+Status: **HISTORICAL DESIGN / IMPLEMENTED WITH RECORDED DEVIATIONS**
 Target: KMTProto v0.2 design review  
 Compatibility baseline: KMTProto v0.1
 
-This document proposes how KMTProto can synchronize current application state
-without changing the KMTProto v0.1 wire protocol or weakening its reliability
-invariants. The frame names and interfaces below are design candidates only.
-This proposal does not add code, frame constants, storage, or business logic.
+The normative implemented State contract is
+[Protocol v0.2](protocol-v0.2.md). This document is retained as design
+rationale and is not a second wire specification.
 
 ## 1. Motivation
 

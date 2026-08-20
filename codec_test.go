@@ -8,7 +8,7 @@ import (
 
 func TestJSONCodecRoundTrip(t *testing.T) {
 	codec := NewJSONCodec()
-	want := Envelope{V: WireVersionV1, Type: FrameSend, ID: "msg_1", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{"text":"hello"}`)})}
+	want := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_1", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{"text":"hello"}`)})}
 	encoded, err := codec.Encode(&want)
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +24,7 @@ func TestJSONCodecRoundTrip(t *testing.T) {
 
 func TestJSONCodecRejectsUnknownEnvelopeField(t *testing.T) {
 	codec := NewJSONCodec()
-	_, err := codec.Decode([]byte(`{"v":1,"type":"HELLO","payload":{},"surprise":true}`))
+	_, err := codec.Decode([]byte(`{"v":2,"type":"HELLO","payload":{},"surprise":true}`))
 	if err == nil {
 		t.Fatal("expected strict decoding error")
 	}
@@ -40,7 +40,7 @@ func TestJSONCodecLimitsInputBeforeDecode(t *testing.T) {
 }
 
 func FuzzJSONCodec(f *testing.F) {
-	f.Add([]byte(`{"v":1,"type":"HELLO","payload":{}}`))
+	f.Add([]byte(`{"v":2,"type":"HELLO","payload":{}}`))
 	f.Add([]byte(`not-json`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		codec := NewJSONCodec()

@@ -69,7 +69,7 @@ func TestDuplicateBindsToFlightBeforeClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	createTestSession(t, server)
-	send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "msg_flight", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_flight", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- server.HandleIncoming(context.Background(), send, NewOutboundQueue()) }()
 	<-store.started
@@ -132,7 +132,7 @@ func TestACKCannotPrecedeComplete(t *testing.T) {
 			}
 			createTestSession(t, server)
 			out := NewOutboundQueue()
-			send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "msg_complete", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+			send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_complete", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 			done := make(chan error, 1)
 			go func() { done <- server.HandleIncoming(context.Background(), send, out) }()
 			<-store.entered
@@ -184,7 +184,7 @@ func TestResumedWelcomeCarriesExplicitBounds(t *testing.T) {
 	if !bytes.Contains(payload, []byte(`"resume_from":1`)) || !bytes.Contains(payload, []byte(`"replay_to":0`)) {
 		t.Fatalf("missing explicit resume bounds: %s", payload)
 	}
-	valid := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s", Payload: payload}
+	valid := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s", Payload: payload}
 	if err := ValidateFrame(&valid, DefaultLimits(), true); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func configuredReadyClient(t *testing.T, mutate func(*ClientConfig)) (*Client, *
 	if _, err := client.StartSession(gen, "test"); err != nil {
 		t.Fatal(err)
 	}
-	welcome := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})}
+	welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})}
 	if _, err := client.HandleIncoming(gen, welcome); err != nil {
 		t.Fatal(err)
 	}
@@ -226,11 +226,11 @@ func configuredReadyClient(t *testing.T, mutate func(*ClientConfig)) (*Client, *
 
 func beginGapReplay(t *testing.T, client *Client, gen ConnectionGeneration, replayTo uint64) {
 	t.Helper()
-	gap := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "gap", SessionID: "s_1", Seq: replayTo + 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	gap := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "gap", SessionID: "s_1", Seq: replayTo + 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, gap); err != nil {
 		t.Fatal(err)
 	}
-	welcome := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: replayTo})}
+	welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: replayTo})}
 	if _, err := client.HandleIncoming(gen, welcome); err != nil {
 		t.Fatal(err)
 	}
@@ -239,11 +239,11 @@ func beginGapReplay(t *testing.T, client *Client, gen ConnectionGeneration, repl
 func TestClientReplayLimitsDoNotAdvanceSequence(t *testing.T) {
 	t.Run("event count", func(t *testing.T) {
 		client, _, gen := configuredReadyClient(t, func(config *ClientConfig) { config.MaxReplayEvents = 2 })
-		gap := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "gap", SessionID: "s_1", Seq: 5, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+		gap := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "gap", SessionID: "s_1", Seq: 5, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 		if _, err := client.HandleIncoming(gen, gap); err != nil {
 			t.Fatal(err)
 		}
-		welcome := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: 4})}
+		welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: 4})}
 		actions, err := client.HandleIncoming(gen, welcome)
 		if err != nil || len(actions) != 3 || client.State() != StateDisconnected || client.LastSeq() != 0 {
 			t.Fatalf("count bound: actions=%d state=%s seq=%d err=%v", len(actions), client.State(), client.LastSeq(), err)
@@ -256,7 +256,7 @@ func TestClientReplayLimitsDoNotAdvanceSequence(t *testing.T) {
 			config.MaxReplayBytes = 1
 		})
 		beginGapReplay(t, client, gen, 2)
-		event := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "e1", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+		event := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "e1", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 		actions, err := client.HandleIncoming(gen, event)
 		if err != nil || len(actions) != 3 || client.State() != StateDisconnected || client.LastSeq() != 0 {
 			t.Fatalf("byte bound: actions=%d state=%s seq=%d err=%v", len(actions), client.State(), client.LastSeq(), err)
@@ -267,7 +267,7 @@ func TestClientReplayLimitsDoNotAdvanceSequence(t *testing.T) {
 func TestEventIdentityWindowIsBoundedAndConservative(t *testing.T) {
 	client, _, gen := configuredReadyClient(t, func(config *ClientConfig) { config.EventIdentityWindow = 2 })
 	for seq := uint64(1); seq <= 3; seq++ {
-		event := Envelope{V: WireVersionV1, Type: FrameEvent, ID: string(rune('a' + seq)), SessionID: "s_1", Seq: seq, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+		event := Envelope{V: WireVersionV2, Type: FrameEvent, ID: string(rune('a' + seq)), SessionID: "s_1", Seq: seq, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 		if _, err := client.HandleIncoming(gen, event); err != nil {
 			t.Fatal(err)
 		}
@@ -278,11 +278,11 @@ func TestEventIdentityWindowIsBoundedAndConservative(t *testing.T) {
 	if retained != 2 {
 		t.Fatalf("retained %d identities, want 2", retained)
 	}
-	tooOld := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "b", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	tooOld := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "b", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, tooOld); !errors.Is(err, ErrIdentityExpired) {
 		t.Fatalf("old unverifiable duplicate: %v", err)
 	}
-	safe := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "c", SessionID: "s_1", Seq: 2, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	safe := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "c", SessionID: "s_1", Seq: 2, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if actions, err := client.HandleIncoming(gen, safe); err != nil || len(actions) != 0 {
 		t.Fatalf("recent safe duplicate: actions=%d err=%v", len(actions), err)
 	}
@@ -295,19 +295,19 @@ func TestEventIdentityWindowIsBoundedAndConservative(t *testing.T) {
 
 func TestPartialReplayIsDiscardedAcrossReconnect(t *testing.T) {
 	client, _, gen := readyClient(t)
-	first := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "e1", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	first := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "e1", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, first); err != nil {
 		t.Fatal(err)
 	}
-	gap := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "e5", SessionID: "s_1", Seq: 5, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	gap := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "e5", SessionID: "s_1", Seq: 5, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, gap); err != nil {
 		t.Fatal(err)
 	}
-	welcome := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 2, ReplayTo: 4})}
+	welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 2, ReplayTo: 4})}
 	if _, err := client.HandleIncoming(gen, welcome); err != nil {
 		t.Fatal(err)
 	}
-	partial := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "e2", SessionID: "s_1", Seq: 2, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	partial := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "e2", SessionID: "s_1", Seq: 2, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if actions, err := client.HandleIncoming(gen, partial); err != nil || len(actions) != 0 || client.LastSeq() != 1 {
 		t.Fatalf("partial replay leaked: actions=%d seq=%d err=%v", len(actions), client.LastSeq(), err)
 	}
@@ -325,7 +325,7 @@ func TestPartialReplayIsDiscardedAcrossReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	for seq := uint64(2); seq <= 4; seq++ {
-		event := Envelope{V: WireVersionV1, Type: FrameEvent, ID: string(rune('c' + seq)), SessionID: "s_1", Seq: seq, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+		event := Envelope{V: WireVersionV2, Type: FrameEvent, ID: string(rune('c' + seq)), SessionID: "s_1", Seq: seq, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 		actions, err := client.HandleIncoming(newGen, event)
 		if err != nil {
 			t.Fatal(err)
@@ -345,14 +345,14 @@ func TestPartialReplayIsDiscardedAcrossReconnect(t *testing.T) {
 func TestInvalidClientStateTransitionsAndOldWelcome(t *testing.T) {
 	client, _, oldGen := readyClient(t)
 	newGen := client.BeginConnect()
-	oldWelcome := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: 0})}
+	oldWelcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ResumeFrom: 1, ReplayTo: 0})}
 	if _, err := client.HandleIncoming(oldGen, oldWelcome); !errors.Is(err, ErrStaleConnection) {
 		t.Fatalf("old WELCOME: %v", err)
 	}
 	if err := client.TransportConnected(newGen); err != nil {
 		t.Fatal(err)
 	}
-	pong := Envelope{V: WireVersionV1, Type: FramePong, SessionID: "s_1", Payload: mustPayload(PongPayload{PingID: "late"})}
+	pong := Envelope{V: WireVersionV2, Type: FramePong, SessionID: "s_1", Payload: mustPayload(PongPayload{PingID: "late"})}
 	if _, err := client.HandleIncoming(newGen, pong); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("PONG in CONNECTED: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestInvalidClientStateTransitionsAndOldWelcome(t *testing.T) {
 	if _, err := client.Resume(newGen); err != nil {
 		t.Fatal(err)
 	}
-	unexpectedNew := Envelope{V: WireVersionV1, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})}
+	unexpectedNew := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})}
 	if _, err := client.HandleIncoming(newGen, unexpectedNew); err == nil {
 		t.Fatal("NEW WELCOME accepted during RESUMING")
 	}
@@ -373,7 +373,7 @@ func TestServerConnectionAdmissionState(t *testing.T) {
 	server, _, _ := newTestServer(t, app)
 	connection := NewServerConnection()
 	gen, out := connection.Replace()
-	send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "m", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "m", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 	if err := connection.Handle(context.Background(), server, gen, send); err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestServerConnectionAdmissionState(t *testing.T) {
 	}
 
 	gen, out = connection.Replace()
-	hello := Envelope{V: WireVersionV1, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
+	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 	if err := connection.Handle(context.Background(), server, gen, hello); err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestServerConnectionAdmissionState(t *testing.T) {
 	}
 
 	gen, out = connection.Replace()
-	resume := Envelope{V: WireVersionV1, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
 	if err := connection.Handle(context.Background(), server, gen, resume); err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestServerReplayEventLimitReturnsSyncRequired(t *testing.T) {
 		}
 		_ = nextTestFrame(t, out)
 	}
-	resume := Envelope{V: WireVersionV1, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
 	if err := server.HandleIncoming(context.Background(), resume, out); err != nil {
 		t.Fatal(err)
 	}
@@ -437,13 +437,143 @@ func TestServerReplayEventLimitReturnsSyncRequired(t *testing.T) {
 	}
 }
 
+func TestServerReplayByteLimitReturnsSyncRequired(t *testing.T) {
+	server, _, _ := newTestServer(t, &recordingApp{})
+	createTestSession(t, server)
+	live := NewOutboundQueue()
+	if err := server.PublishEvent("s_1", "large_event", "test", json.RawMessage(`{"value":"012345678901234567890123456789"}`), live); err != nil {
+		t.Fatal(err)
+	}
+	event := nextTestFrame(t, live)
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.MaxReplayBytes = len(encoded) - 1
+
+	outbound := NewOutboundQueue()
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
+	if err := server.HandleIncoming(context.Background(), resume, outbound); err != nil {
+		t.Fatal(err)
+	}
+	frame := nextTestFrame(t, outbound)
+	var payload ErrorPayload
+	if frame.Type != FrameError || decodePayload(frame.Payload, &payload, true) != nil || payload.Code != ErrorSyncRequired {
+		t.Fatalf("expected byte-bounded SYNC_REQUIRED, got %#v %#v", frame, payload)
+	}
+}
+
+func TestGapResumeAcceptedOnReadyServerConnection(t *testing.T) {
+	server, clock, _ := newTestServer(t, &recordingApp{})
+	clientConfig := DefaultClientConfig()
+	clientConfig.Clock = clock
+	client, err := NewClient(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientGeneration := client.BeginConnect()
+	if err := client.TransportConnected(clientGeneration); err != nil {
+		t.Fatal(err)
+	}
+	helloActions, err := client.StartSession(clientGeneration, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	connection := NewServerConnection()
+	serverGeneration, outbound := connection.Replace()
+	if err := connection.Handle(context.Background(), server, serverGeneration, helloActions[0].(SendFrameAction).Frame); err != nil {
+		t.Fatal(err)
+	}
+	welcome := nextTestFrame(t, outbound)
+	if _, err := client.HandleIncoming(clientGeneration, welcome); err != nil {
+		t.Fatal(err)
+	}
+
+	live := NewOutboundQueue()
+	for _, id := range []string{"event_1", "event_2"} {
+		if err := server.PublishEvent("s_1", id, "test", json.RawMessage(`{}`), live); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = nextTestFrame(t, live)
+	gap := nextTestFrame(t, live)
+	resumeActions, err := client.HandleIncoming(clientGeneration, gap)
+	if err != nil || len(resumeActions) != 1 || client.State() != StateResuming || client.LastSeq() != 0 {
+		t.Fatalf("gap did not produce RESUME: actions=%d state=%s seq=%d err=%v", len(resumeActions), client.State(), client.LastSeq(), err)
+	}
+	resume := resumeActions[0].(SendFrameAction).Frame
+	if err := connection.Handle(context.Background(), server, serverGeneration, resume); err != nil {
+		t.Fatal(err)
+	}
+	if connection.State() != ServerConnectionReady {
+		t.Fatalf("server connection did not return to READY: %s", connection.State())
+	}
+
+	frames := []Envelope{nextTestFrame(t, outbound), nextTestFrame(t, outbound), nextTestFrame(t, outbound)}
+	for index, frame := range frames {
+		actions, handleErr := client.HandleIncoming(clientGeneration, frame)
+		if handleErr != nil {
+			t.Fatalf("resume frame %d failed: %v", index, handleErr)
+		}
+		if index < 2 && len(actions) != 0 {
+			t.Fatalf("partial replay leaked actions at frame %d: %#v", index, actions)
+		}
+		if index == 2 && (len(actions) != 3 || client.State() != StateReady || client.LastSeq() != 2) {
+			t.Fatalf("gap recovery incomplete: actions=%d state=%s seq=%d", len(actions), client.State(), client.LastSeq())
+		}
+	}
+}
+
 func TestStreamLaneRecoversFromPanic(t *testing.T) {
 	server := &Server{lanes: make(map[string]*streamLane)}
-	if err := server.runStream("s", func() error { panic("boom") }); err == nil {
+	if err := server.runStream("s", func(*streamLane) error { panic("boom") }); err == nil {
 		t.Fatal("expected recovered panic error")
 	}
-	if err := server.runStream("s", func() error { return nil }); err != nil {
+	if err := server.runStream("s", func(*streamLane) error { return nil }); err != nil {
 		t.Fatalf("lane remained unusable after panic: %v", err)
+	}
+}
+
+type reentrantEventAppender struct {
+	server   *Server
+	delegate EventAppender
+	outbound *OutboundQueue
+	result   error
+}
+
+func (a *reentrantEventAppender) Append(sessionID, eventID, eventType string, content []byte, timestamp int64) (Envelope, error) {
+	a.result = a.server.PublishEvent(sessionID, "nested_event", eventType, json.RawMessage(`{}`), a.outbound)
+	return a.delegate.Append(sessionID, eventID, eventType, content, timestamp)
+}
+
+func TestEventAppenderCallbackReentryFailsWithoutDeadlock(t *testing.T) {
+	clock := NewFakeClock(time.Unix(6, 0))
+	config := DefaultServerConfig()
+	config.Clock = clock
+	config.NewSessionID = func() (string, error) { return "s_1", nil }
+	replay := NewMemoryReplayStore()
+	nestedOutbound := NewOutboundQueue()
+	appender := &reentrantEventAppender{delegate: replay, outbound: nestedOutbound}
+	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, appender, &recordingApp{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appender.server = server
+	createTestSession(t, server)
+
+	outbound := NewOutboundQueue()
+	if err := server.PublishEvent("s_1", "event_1", "test", json.RawMessage(`{}`), outbound); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(appender.result, ErrStreamCallbackActive) {
+		t.Fatalf("nested Event publication returned %v, want ErrStreamCallbackActive", appender.result)
+	}
+	if frame := nextTestFrame(t, outbound); frame.Type != FrameEvent || frame.ID != "event_1" || frame.Seq != 1 {
+		t.Fatalf("outer Event publication failed after rejected reentry: %#v", frame)
+	}
+	if queuedFrameCount(nestedOutbound) != 0 {
+		t.Fatal("nested Event publication unexpectedly reached outbound")
 	}
 }
 
@@ -488,7 +618,7 @@ func TestErrorBehaviorAndRetryabilityValidation(t *testing.T) {
 		if !ok || behavior.Retryable != tc.retryable || behavior.CloseConnection != tc.close || behavior.AbandonSession != tc.abandon || behavior.FullSyncRequired != tc.fullSync {
 			t.Fatalf("%s behavior=%#v ok=%v", tc.code, behavior, ok)
 		}
-		frame := Envelope{V: WireVersionV1, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: tc.code, Retryable: tc.retryable})}
+		frame := Envelope{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: tc.code, Retryable: tc.retryable})}
 		if err := ValidateFrame(&frame, DefaultLimits(), true); err != nil {
 			t.Fatalf("%s valid ERROR rejected: %v", tc.code, err)
 		}
@@ -498,23 +628,23 @@ func TestErrorBehaviorAndRetryabilityValidation(t *testing.T) {
 			t.Fatalf("%s conflicting retryability accepted", tc.code)
 		}
 	}
-	internal := Envelope{V: WireVersionV1, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorInternal, Retryable: true})}
+	internal := Envelope{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorInternal, Retryable: true})}
 	if err := ValidateFrame(&internal, DefaultLimits(), true); err != nil {
 		t.Fatalf("retryable INTERNAL rejected: %v", err)
 	}
 }
 
-func TestV01FrameValidationMatrix(t *testing.T) {
+func TestV02BaseFrameValidationMatrix(t *testing.T) {
 	valid := []Envelope{
-		{V: WireVersionV1, Type: FrameHello, ID: "optional", Payload: mustPayload(HelloPayload{})},
-		{V: WireVersionV1, Type: FrameWelcome, SessionID: "s", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})},
-		{V: WireVersionV1, Type: FramePing, SessionID: "s", Payload: mustPayload(PingPayload{PingID: "p"})},
-		{V: WireVersionV1, Type: FramePong, SessionID: "s", Payload: mustPayload(PongPayload{PingID: "p"})},
-		{V: WireVersionV1, Type: FrameSend, ID: "m", SessionID: "s", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})},
-		{V: WireVersionV1, Type: FrameAck, SessionID: "s", Payload: mustPayload(AckPayload{RefID: "m"})},
-		{V: WireVersionV1, Type: FrameEvent, ID: "e", SessionID: "s", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})},
-		{V: WireVersionV1, Type: FrameResume, SessionID: "s", Payload: mustPayload(ResumePayload{LastSeq: 0})},
-		{V: WireVersionV1, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorBadRequest, Retryable: false})},
+		{V: WireVersionV2, Type: FrameHello, ID: "optional", Payload: mustPayload(HelloPayload{})},
+		{V: WireVersionV2, Type: FrameWelcome, SessionID: "s", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})},
+		{V: WireVersionV2, Type: FramePing, SessionID: "s", Payload: mustPayload(PingPayload{PingID: "p"})},
+		{V: WireVersionV2, Type: FramePong, SessionID: "s", Payload: mustPayload(PongPayload{PingID: "p"})},
+		{V: WireVersionV2, Type: FrameSend, ID: "m", SessionID: "s", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})},
+		{V: WireVersionV2, Type: FrameAck, SessionID: "s", Payload: mustPayload(AckPayload{RefID: "m"})},
+		{V: WireVersionV2, Type: FrameEvent, ID: "e", SessionID: "s", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})},
+		{V: WireVersionV2, Type: FrameResume, SessionID: "s", Payload: mustPayload(ResumePayload{LastSeq: 0})},
+		{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorBadRequest, Retryable: false})},
 	}
 	for _, frame := range valid {
 		if err := ValidateFrame(&frame, DefaultLimits(), true); err != nil {
@@ -547,7 +677,7 @@ func TestV01FrameValidationMatrix(t *testing.T) {
 			t.Fatalf("%s without session accepted", frame.Type)
 		}
 	}
-	unknown := Envelope{V: WireVersionV1, Type: FrameType("FUTURE"), Payload: json.RawMessage(`{}`)}
+	unknown := Envelope{V: WireVersionV2, Type: FrameType("FUTURE"), Payload: json.RawMessage(`{}`)}
 	if err := ValidateFrame(&unknown, DefaultLimits(), true); err == nil {
 		t.Fatal("unknown frame type accepted")
 	}
@@ -558,21 +688,21 @@ func TestOnlyEventChangesLastSequence(t *testing.T) {
 	if _, err := client.SendPing(gen, "p"); err != nil {
 		t.Fatal(err)
 	}
-	pong := Envelope{V: WireVersionV1, Type: FramePong, SessionID: "s_1", Payload: mustPayload(PongPayload{PingID: "p"})}
+	pong := Envelope{V: WireVersionV2, Type: FramePong, SessionID: "s_1", Payload: mustPayload(PongPayload{PingID: "p"})}
 	if _, err := client.HandleIncoming(gen, pong); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.EnqueueSend("m", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	ack := Envelope{V: WireVersionV1, Type: FrameAck, SessionID: "s_1", Payload: mustPayload(AckPayload{RefID: "m"})}
+	ack := Envelope{V: WireVersionV2, Type: FrameAck, SessionID: "s_1", Payload: mustPayload(AckPayload{RefID: "m"})}
 	if _, err := client.HandleIncoming(gen, ack); err != nil {
 		t.Fatal(err)
 	}
 	if client.LastSeq() != 0 {
 		t.Fatalf("non-EVENT changed last_seq to %d", client.LastSeq())
 	}
-	event := Envelope{V: WireVersionV1, Type: FrameEvent, ID: "e", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
+	event := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "e", SessionID: "s_1", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, event); err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +729,7 @@ func TestServerConnectionReplacementFencesLateHandshake(t *testing.T) {
 	}
 	connection := NewServerConnection()
 	oldGeneration, _ := connection.Replace()
-	hello := Envelope{V: WireVersionV1, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
+	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 	done := make(chan error, 1)
 	go func() { done <- connection.Handle(context.Background(), server, oldGeneration, hello) }()
 	<-started
@@ -615,10 +745,10 @@ func TestJSONCodecFailureClassesAreDeterministic(t *testing.T) {
 	codec := NewJSONCodec()
 	cases := map[string][]byte{
 		"malformed":           []byte(`{"v":`),
-		"unknown type":        []byte(`{"v":1,"type":"FUTURE","payload":{}}`),
-		"unsupported version": []byte(`{"v":2,"type":"HELLO","payload":{}}`),
-		"missing payload":     []byte(`{"v":1,"type":"HELLO"}`),
-		"trailing value":      []byte(`{"v":1,"type":"HELLO","payload":{}} {}`),
+		"unknown type":        []byte(`{"v":2,"type":"FUTURE","payload":{}}`),
+		"unsupported version": []byte(`{"v":1,"type":"HELLO","payload":{}}`),
+		"missing payload":     []byte(`{"v":2,"type":"HELLO"}`),
+		"trailing value":      []byte(`{"v":2,"type":"HELLO","payload":{}} {}`),
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -632,11 +762,11 @@ func TestJSONCodecFailureClassesAreDeterministic(t *testing.T) {
 	limits.MaxIDLength = 4
 	limits.MaxPayloadSize = 16
 	limited := &JSONCodec{Limits: limits, Strict: true}
-	oversizedID := []byte(`{"v":1,"type":"SEND","id":"12345","session_id":"s","payload":{"content":{}}}`)
+	oversizedID := []byte(`{"v":2,"type":"SEND","id":"12345","session_id":"s","payload":{"content":{}}}`)
 	if _, err := limited.Decode(oversizedID); err == nil {
 		t.Fatal("oversized ID accepted")
 	}
-	oversizedPayload := []byte(`{"v":1,"type":"SEND","id":"m","session_id":"s","payload":{"content":"1234567890"}}`)
+	oversizedPayload := []byte(`{"v":2,"type":"SEND","id":"m","session_id":"s","payload":{"content":"1234567890"}}`)
 	if _, err := limited.Decode(oversizedPayload); err == nil {
 		t.Fatal("oversized payload accepted")
 	}
@@ -664,7 +794,7 @@ func TestPreCompleteFailureWindowsNeverRepeatApplication(t *testing.T) {
 				t.Fatal(err)
 			}
 			createTestSession(t, server)
-			send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "m", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+			send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "m", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 			if err := server.HandleIncoming(context.Background(), send, NewOutboundQueue()); err == nil {
 				t.Fatal("expected injected failure")
 			}
@@ -696,7 +826,7 @@ func TestCompleteThenOutboundFailureReplaysStoredACK(t *testing.T) {
 	app := &recordingApp{}
 	server, _, _ := newTestServer(t, app)
 	createTestSession(t, server)
-	send := Envelope{V: WireVersionV1, Type: FrameSend, ID: "m_lost", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
+	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "m_lost", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 	lost := NewOutboundQueue()
 	lost.Close()
 	if err := server.HandleIncoming(context.Background(), send, lost); !errors.Is(err, ErrOutboundClosed) {

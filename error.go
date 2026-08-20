@@ -3,15 +3,20 @@ package kmtproto
 import "fmt"
 
 const (
-	ErrorBadRequest         = "BAD_REQUEST"
-	ErrorUnsupportedVersion = "UNSUPPORTED_VERSION"
-	ErrorUnauthorized       = "UNAUTHORIZED"
-	ErrorInvalidSession     = "INVALID_SESSION"
-	ErrorNotFound           = "NOT_FOUND"
-	ErrorRateLimited        = "RATE_LIMITED"
-	ErrorSyncRequired       = "SYNC_REQUIRED"
-	ErrorInternal           = "INTERNAL"
-	ErrorProtocolViolation  = "PROTOCOL_VIOLATION"
+	ErrorBadRequest          = "BAD_REQUEST"
+	ErrorUnsupportedVersion  = "UNSUPPORTED_VERSION"
+	ErrorUnsupportedFeature  = "UNSUPPORTED_FEATURE"
+	ErrorInvalidCapability   = "INVALID_CAPABILITY"
+	ErrorInvalidStateVersion = "INVALID_STATE_VERSION"
+	ErrorUnauthorized        = "UNAUTHORIZED"
+	ErrorInvalidSession      = "INVALID_SESSION"
+	ErrorNotFound            = "NOT_FOUND"
+	ErrorRateLimited         = "RATE_LIMITED"
+	ErrorSyncRequired        = "SYNC_REQUIRED"
+	ErrorStateSyncRequired   = "STATE_SYNC_REQUIRED"
+	ErrorStateUnavailable    = "STATE_UNAVAILABLE"
+	ErrorInternal            = "INTERNAL"
+	ErrorProtocolViolation   = "PROTOCOL_VIOLATION"
 )
 
 // ErrorBehavior defines the protocol disposition associated with a standard
@@ -25,13 +30,19 @@ type ErrorBehavior struct {
 	FullSyncRequired  bool
 }
 
-// BehaviorForErrorCode returns the v0.1 behavior for a standard ERROR code.
+// BehaviorForErrorCode returns the protocol disposition for a standard ERROR.
 func BehaviorForErrorCode(code string) (ErrorBehavior, bool) {
 	switch code {
 	case ErrorBadRequest:
 		return ErrorBehavior{RetryabilityFixed: true}, true
 	case ErrorUnsupportedVersion:
 		return ErrorBehavior{RetryabilityFixed: true, CloseConnection: true}, true
+	case ErrorUnsupportedFeature:
+		return ErrorBehavior{RetryabilityFixed: true, CloseConnection: true}, true
+	case ErrorInvalidCapability:
+		return ErrorBehavior{RetryabilityFixed: true}, true
+	case ErrorInvalidStateVersion:
+		return ErrorBehavior{RetryabilityFixed: true}, true
 	case ErrorUnauthorized:
 		return ErrorBehavior{RetryabilityFixed: true, CloseConnection: true}, true
 	case ErrorInvalidSession:
@@ -42,6 +53,10 @@ func BehaviorForErrorCode(code string) (ErrorBehavior, bool) {
 		return ErrorBehavior{Retryable: true, RetryabilityFixed: true}, true
 	case ErrorSyncRequired:
 		return ErrorBehavior{RetryabilityFixed: true, FullSyncRequired: true}, true
+	case ErrorStateSyncRequired:
+		return ErrorBehavior{RetryabilityFixed: true, CloseConnection: true}, true
+	case ErrorStateUnavailable:
+		return ErrorBehavior{Retryable: true, RetryabilityFixed: true, CloseConnection: true}, true
 	case ErrorInternal:
 		return ErrorBehavior{}, true
 	case ErrorProtocolViolation:
@@ -64,13 +79,22 @@ type ProtocolError struct {
 	RefID     string
 	Retryable bool
 	Close     bool
+	Cause     error
 }
+
+func (e *ProtocolError) Unwrap() error { return e.Cause }
 
 func (e *ProtocolError) Error() string {
 	if e.RefID == "" {
 		return fmt.Sprintf("kmtproto: %s: %s", e.Code, e.Message)
 	}
 	return fmt.Sprintf("kmtproto: %s (%s): %s", e.Code, e.RefID, e.Message)
+}
+
+func newProtocolErrorWithCause(code, message string, cause error) *ProtocolError {
+	error := NewProtocolError(code, message)
+	error.Cause = cause
+	return error
 }
 
 func NewProtocolError(code, message string) *ProtocolError {

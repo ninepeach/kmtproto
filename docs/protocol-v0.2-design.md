@@ -1,13 +1,20 @@
 # KMTProto v0.2 — Protocol Evolution Design Proposal
 
-Status: **PROPOSAL / NOT IMPLEMENTED**  
-Target: KMTProto v0.2 design review  
+Status: **HISTORICAL PROPOSAL / SUPERSEDED**
+
+Target: KMTProto v0.2 design review
+
 Baseline: a new protocol generation with no v0.1 compatibility mode
 
-This document proposes KMTProto v0.2 as a transport-independent chat
+Implementation note: the implemented protocol selected a single Wire Version
+2 baseline while retaining the existing Frame-specific correlation and
+WELCOME(RESUMED) model. The authoritative implemented contract is
+`docs/protocol-v0.2.md`; this proposal is retained only as design history.
+
+This document originally proposed KMTProto v0.2 as a transport-independent chat
 synchronization protocol. It is intentionally a design artifact: the frame
-names, schemas, transitions, limits, and interfaces below are not implemented.
-No v0.1 wire behavior is modified by this proposal.
+names, schemas, transitions, limits, and interfaces below describe that larger
+cutover and are not a statement that every item is implemented.
 
 Normative terms such as MUST, MUST NOT, SHOULD, and MAY describe the proposed
 v0.2 contract.
@@ -761,33 +768,40 @@ provide a database or distributed transaction coordinator.
 
 ## 12. Resume Integration
 
-Three recovery strategies were considered.
+Four recovery strategies were considered.
 
 | Option | Behavior | Advantage | Problem |
 |---|---|---|---|
 | A | Recover EVENT only | Smallest protocol | State may remain indefinitely stale |
 | B | Automatically replay EVENT and all State | One apparent recovery flow | Unbounded, couples unrelated namespaces, leaks visibility policy into Resume |
 | C | Recover EVENT, then explicitly query selected State | Bounded, authorized, application-directed | Requires one additional request |
+| D | Recover EVENT, then include a client-selected namespace snapshot in the same Resume | One deterministic recovery gate with bounded selectors | Requires a namespace snapshot provider and strict bounds |
 
-### 12.1 Recommendation: Option C
+### 12.1 Implemented baseline: Option D
 
-v0.2 SHOULD use Option C:
+v0.2 uses an optional, client-required State phase in RESUME:
 
 1. negotiate v2 and `state-sync` in HELLO/WELCOME;
-2. establish the fixed EVENT Replay boundary with RESUME/RESUME_OK;
-3. complete and atomically deliver EVENT Replay;
-4. enter READY;
-5. let the client/application issue bounded STATE_QUERY selectors;
-6. apply STATE_SNAPSHOT under object version rules;
-7. merge later STATE_UPDATE frames using the same rules.
+2. send `RESUME(last_seq, state_sync.namespaces)` when State refresh is required;
+3. acknowledge the fixed EVENT boundary and exact namespaces in
+   `WELCOME(RESUMED)`;
+4. validate and buffer the complete EVENT Replay without application delivery;
+5. receive exactly one bounded STATE_SNAPSHOT after the Replay boundary;
+6. atomically apply the snapshot under object version rules;
+7. release EVENT actions, State actions, and finally READY;
+8. merge later STATE_UPDATE frames using the same version rules.
 
-This ordering preserves EVENT history before fetching current State, prevents
-State payload volume from changing Resume safety, and lets authorization decide
-which State Objects the Session may observe.
+Omitting `state_sync` preserves the v0.1 EVENT-only Resume wire shape and
+behavior. Requesting State Sync is a requirement: the server either echoes the
+canonical namespace list and supplies the snapshot or returns ERROR. EVENT
+Replay identity and `replay_to` are unchanged, and State frames never consume
+EVENT sequence.
 
-State query/update is not tied to EVENT sequence. A live State update arriving
-before its query response is safe: both are merged by object version, so the
-older response cannot overwrite the newer value.
+The server serializes the Resume batch as `WELCOME`, replay EVENT frames, then
+STATE_SNAPSHOT. Live EVENT and STATE_UPDATE publication follows that batch.
+The client emits no application delivery actions until both requested recovery
+phases are complete. A stale or conflicting snapshot fails conservatively and
+never advances `last_seq`.
 
 ### 12.2 EVENT and STATE consistency
 
@@ -809,14 +823,12 @@ connection, but that order is not a cross-model transaction guarantee.
 
 ### 12.3 Namespace-wide snapshots
 
-Exact-ID queries are the recommended v0.2 baseline. A namespace-wide snapshot
-requires an explicit snapshot barrier so that live updates cannot create an
-ambiguous cut between “included in snapshot” and “arrived after snapshot.” It
-also needs pagination or stronger size limits.
-
-Namespace-wide synchronization SHOULD therefore be a future versioned
-capability, not an implicit meaning of an empty selector in the base
-`state-sync` capability.
+Exact-ID STATE_QUERY remains the normal READY-state query mechanism. Resume may
+instead request a bounded, explicit namespace list. The provider returns one
+logical snapshot behind the Session serialization lane, subject to
+`MaxStateSyncNamespaces`, `MaxStateSnapshotObjects`, payload, and client cache
+limits. Snapshot omission does not imply deletion in v0.2; deletion/tombstone
+semantics remain out of scope.
 
 ## 13. Error Model
 
@@ -839,22 +851,32 @@ retained. `retry_after_ms` is optional and meaningful only when retryable.
 | `BAD_REQUEST` | no | reject frame; connection may remain open |
 | `UNSUPPORTED_VERSION` | no | fail handshake and close |
 | `UNSUPPORTED_FEATURE` | no | fail required negotiation and close |
+| `INVALID_CAPABILITY` | no | reject malformed, duplicate, oversized, or non-canonical capability data; connection may remain open |
+| `INVALID_STATE_VERSION` | no | reject a structurally invalid, stale, or same-version conflicting State replacement without changing cached State |
 | `UNAUTHORIZED` | no | reject operation; during handshake normally close |
 | `INVALID_SESSION` | no | abandon Session and close/resynchronize as caller policy |
 | `NOT_FOUND` | no | reject referenced resource; connection remains open |
 | `RATE_LIMITED` | yes | connection remains open; obey retry hint |
 | `SYNC_REQUIRED` | no automatic Resume | stop Replay and request application full sync |
+| `STATE_SYNC_REQUIRED` | no | reject a stale/conflicting Resume snapshot and close without advancing EVENT position |
+| `STATE_UNAVAILABLE` | yes | close the current connection; retain Session position so the caller may retry Resume |
 | `INTERNAL` | explicitly declared | implementation policy; never imply commit success |
 | `PROTOCOL_VIOLATION` | no | close active protocol connection |
 
-Two candidate State codes are deliberately not adopted in the minimal model:
+The minimal model deliberately does not add aliases for failures already
+represented by the base protocol:
 
-- `STATE_NOT_FOUND` is represented by the snapshot's `missing` results, or by
-  generic `NOT_FOUND` when no snapshot can be produced;
-- `INVALID_STATE_VERSION` is not a normal client-write conflict because clients
-  do not assign authoritative versions. A malformed or conflicting
-  authoritative State frame is a `PROTOCOL_VIOLATION`; an application
-  compare-and-set conflict remains behind the SEND/Application boundary.
+- `INVALID_FRAME` is `BAD_REQUEST`; the diagnostic message retains the precise
+  structural reason;
+- `STATE_NOT_FOUND` is represented by omission from an exact-query snapshot,
+  or by generic `NOT_FOUND` when an operation itself references an absent
+  protocol resource;
+- `STATE_SYNC_FAILED` is represented by `STATE_UNAVAILABLE` during Resume.
+
+`INVALID_STATE_VERSION` is a protocol-level rejection for a zero/exhausted
+version and for a stale or same-version conflicting authoritative State
+replacement. It is not an Application compare-and-set or business conflict
+code.
 
 An invalid ERROR never causes another ERROR. Implementations log and ignore it
 or close according to local safety policy.
@@ -866,13 +888,14 @@ v0.2 defines configurable defaults and negotiated hard ceilings for at least:
 - encoded frame bytes;
 - decoded/decompressed frame bytes;
 - protocol payload bytes;
-- ID, Session ID, namespace, object ID, and error message lengths;
+- ID, Session ID, client name, EVENT type, namespace, object ID, and error
+  message lengths;
 - capability count, capability-name length, versions per capability, and
   capability-parameter bytes;
 - pending reliable SEND count and bytes;
 - Replay event count and bytes;
 - EVENT identity-retention window;
-- State Object data bytes;
+- State Object data bytes and complete encoded State Object bytes;
 - selectors, IDs per selector, and total IDs per query;
 - snapshot object count and bytes;
 - concurrent outstanding State queries;
@@ -1012,7 +1035,7 @@ The future implementation should prove at least:
 - PING/PONG and State frames never change EVENT ordering;
 - stale generations cannot change negotiated, EVENT, heartbeat, or State state;
 - old State versions never replace new versions;
-- equal version plus different State is a protocol violation;
+- equal version plus different State is rejected as `INVALID_STATE_VERSION`;
 - snapshots validate completely before any object is applied;
 - all negotiated and local limits fail closed without panic or unbounded
   allocation.

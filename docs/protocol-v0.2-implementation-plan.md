@@ -1,16 +1,21 @@
 # KMTProto v0.2 — Implementation Plan
 
-Status: **PLANNING / NO IMPLEMENTATION**
+Status: **HISTORICAL ROADMAP / IMPLEMENTED WITH RECORDED DEVIATIONS**
 Design source: `docs/protocol-v0.2-design.md`
 Target: KMTProto v0.2 implementation roadmap
 
-This document converts the approved v0.2 protocol proposal into an incremental,
-testable implementation sequence. It does not implement any Frame Type, change
-Go code, or modify the v0.1 implementation.
+Implementation note: the Phase 0–5 sequence implemented capability
+negotiation, State primitives and frames, Resume/State integration, and
+hardening. Finalization selected Wire Version 2 as the only baseline while
+retaining Frame-specific correlation and WELCOME(RESUMED). The authoritative
+contract is `docs/protocol-v0.2.md`.
 
-Normative protocol behavior remains defined by
-`docs/protocol-v0.2-design.md`. If this plan and the design disagree, the design
-wins and the plan must be updated before implementation continues.
+This document converts the approved v0.2 protocol proposal into an incremental,
+testable implementation sequence. It is a roadmap rather than the current wire
+contract.
+
+This roadmap is non-normative. `docs/protocol-v0.2.md` defines the implemented
+protocol when this document or the historical design differs.
 
 ## 1. Overview
 
@@ -770,8 +775,9 @@ EVENT Replay.
 | Strategy | Result | Decision |
 |---|---|---|
 | A: Resume only EVENT | safe but State may remain stale indefinitely | insufficient as complete v0.2 guidance |
-| B: EVENT plus automatic State snapshot | unbounded and couples authorization/visibility to Resume | reject |
-| C: EVENT Replay then client-selected State query | bounded and application-directed | adopt |
+| B: EVENT plus automatic all-State snapshot | unbounded and couples authorization/visibility to Resume | reject |
+| C: EVENT Replay then client-selected State query | bounded but requires a second recovery round trip | retain for READY-state queries |
+| D: EVENT Replay plus explicitly requested namespace snapshot | bounded, client-directed, one recovery gate | implemented |
 
 #### Resume flow
 
@@ -779,13 +785,12 @@ EVENT Replay.
 new transport / new generation
   -> HELLO(existing session_id, offered capabilities, receive limits)
   -> WELCOME(RESUME_REQUIRED, accepted capabilities, limits)
-  -> RESUME(last_seq)
-  -> RESUME_OK(resume_from, replay_to)
+  -> RESUME(last_seq, optional state_sync.namespaces)
+  -> WELCOME(RESUMED, resume_from, replay_to, optional state_sync.namespaces)
   -> validate and buffer EVENT resume_from..replay_to
-  -> atomically deliver complete Replay
+  -> optional STATE_SNAPSHOT
+  -> atomically release Replay and State actions
   -> READY
-  -> STATE_QUERY(exact application-selected identities)
-  -> STATE_SNAPSHOT
 ```
 
 RESUME_OK rules:
@@ -793,16 +798,20 @@ RESUME_OK rules:
 - Envelope ID, Session ID, and `reply_to` required;
 - `reply_to` matches the current RESUME request;
 - fixed `resume_from` and `replay_to` required, including an empty range;
-- no EVENT is accepted as Replay before RESUME_OK;
+- no EVENT is accepted as Replay before WELCOME(RESUMED);
 - live EVENT cannot interleave before `replay_to`;
 - partial Replay is never delivered;
-- State query is rejected until EVENT Replay completes and READY is restored.
+- when State Sync is requested, neither EVENT nor State actions are released
+  until the complete snapshot is accepted;
+- STATE_SNAPSHOT follows `replay_to`, never consumes EVENT sequence, and READY
+  is the final action;
+- STATE_QUERY remains available after READY and is not implicitly issued.
 
 State cache behavior across disconnect must be explicit:
 
 - cached values may remain readable as STALE application data;
 - they are not silently declared CURRENT after Resume;
-- explicit State queries move selected identities through SYNCING to CURRENT;
+- an accepted Resume snapshot refreshes returned identities;
 - a current-generation STATE_UPDATE may refresh an identity after READY;
 - Session abandonment clears Session-bound protocol cache metadata.
 
@@ -813,8 +822,9 @@ Phase 6 tests:
 - fixed Replay boundary and original EVENT identity;
 - empty Replay reaches READY deterministically;
 - partial Replay disconnect and second Resume;
-- State query rejected before Replay completion;
-- State query emitted only after READY;
+- optional namespace request validation and capability gating;
+- EVENT Replay followed by exactly one bounded State snapshot;
+- State snapshot failure and stale-version conservative failure;
 - snapshot/update races after Resume;
 - smaller negotiated Replay/snapshot limits on reconnect;
 - missing required Session Capability rejects Resume;
@@ -835,14 +845,17 @@ disposition unambiguous.
 Adopt `UNSUPPORTED_FEATURE` for an unsupported required Capability during
 negotiation. It is non-retryable for that HELLO and closes the connection.
 
-The following proposed codes should not automatically become wire codes because
-the approved design already provides more precise behavior:
+Phase 5 adopts two narrow validation codes while retaining existing codes for
+all other cases:
 
 | Candidate | Recommended v0.2 treatment |
 |---|---|
 | `CAPABILITY_REQUIRED` | local API error before send; peer use of an unaccepted Capability is `PROTOCOL_VIOLATION` |
-| `INVALID_STATE_VERSION` | local validation/merge error; conflicting authoritative wire State is `PROTOCOL_VIOLATION` |
-| `STATE_NOT_FOUND` | represent exact query misses in STATE_SNAPSHOT `missing`; otherwise use generic `NOT_FOUND` |
+| `INVALID_CAPABILITY` | wire validation error for malformed, duplicate, oversized, or non-canonical capability declarations |
+| `INVALID_STATE_VERSION` | wire validation/merge error for zero, exhausted, stale, or same-version conflicting authoritative State |
+| `STATE_NOT_FOUND` | omit exact query misses from STATE_SNAPSHOT; otherwise use generic `NOT_FOUND` |
+| `INVALID_FRAME` | retain `BAD_REQUEST` and a precise diagnostic message |
+| `STATE_SYNC_FAILED` | retain `STATE_UNAVAILABLE` |
 
 Adding one of these wire codes requires amending the design before code, not an
 implementation-only decision.
@@ -858,6 +871,8 @@ Required behavior:
 | `BAD_REQUEST` | no | reject operation; connection may stay open |
 | `UNSUPPORTED_VERSION` | no | fail HELLO and close |
 | `UNSUPPORTED_FEATURE` | no | fail required Capability negotiation and close |
+| `INVALID_CAPABILITY` | no | reject invalid negotiation input; connection may stay open |
+| `INVALID_STATE_VERSION` | no | reject State without replacing retained State; connection may stay open |
 | `UNAUTHORIZED` | no | Application policy; handshake failure normally closes |
 | `INVALID_SESSION` | no | abandon resumable Session context |
 | `NOT_FOUND` | no | reject referenced resource; keep connection open |
@@ -1214,7 +1229,7 @@ without configured bounds.
 | State cache grows forever | client memory exhaustion | object/byte/tombstone bounds |
 | old generation async completion | current negotiated or State state corrupted | generation fence before every mutation |
 | locks span Store/Application calls | deadlock and latency amplification | compute actions under lock; perform I/O after unlock |
-| new error codes duplicate existing semantics | inconsistent retry and connection behavior | adopt only UNSUPPORTED_FEATURE without design amendment |
+| new error codes duplicate existing semantics | inconsistent retry and connection behavior | Phase 5 adds only `INVALID_CAPABILITY` and `INVALID_STATE_VERSION`; other aliases retain existing codes |
 | constructor churn across phases | repeated public API breaks | freeze config/dependency structs in Phase 0 |
 
 The highest-risk implementation areas are Phase 0 correlation/validation,

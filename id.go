@@ -50,3 +50,13 @@ func DefaultSessionIDGenerator(clock Clock) func() (string, error) {
 		return "s_" + id, nil
 	}
 }
+
+func DefaultFrameIDGenerator(clock Clock) func() (string, error) {
+	return func() (string, error) {
+		id, err := NewULID(clock, rand.Reader)
+		if err != nil {
+			return "", err
+		}
+		return "f_" + id, nil
+	}
+}

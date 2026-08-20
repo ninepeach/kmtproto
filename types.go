@@ -2,20 +2,24 @@ package kmtproto
 
 import "encoding/json"
 
-const WireVersionV1 uint16 = 1
+// WireVersionV2 is the only wire version accepted by the v0.2 protocol.
+const WireVersionV2 uint16 = 2
 
 type FrameType string
 
 const (
-	FrameHello   FrameType = "HELLO"
-	FrameWelcome FrameType = "WELCOME"
-	FramePing    FrameType = "PING"
-	FramePong    FrameType = "PONG"
-	FrameSend    FrameType = "SEND"
-	FrameAck     FrameType = "ACK"
-	FrameEvent   FrameType = "EVENT"
-	FrameResume  FrameType = "RESUME"
-	FrameError   FrameType = "ERROR"
+	FrameHello         FrameType = "HELLO"
+	FrameWelcome       FrameType = "WELCOME"
+	FramePing          FrameType = "PING"
+	FramePong          FrameType = "PONG"
+	FrameSend          FrameType = "SEND"
+	FrameAck           FrameType = "ACK"
+	FrameEvent         FrameType = "EVENT"
+	FrameResume        FrameType = "RESUME"
+	FrameError         FrameType = "ERROR"
+	FrameStateQuery    FrameType = "STATE_QUERY"
+	FrameStateSnapshot FrameType = "STATE_SNAPSHOT"
+	FrameStateUpdate   FrameType = "STATE_UPDATE"
 )
 
 type Envelope struct {
