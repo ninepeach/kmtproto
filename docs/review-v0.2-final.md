@@ -458,7 +458,10 @@ Most Phase 0–5 API changes are additive:
 - additional protocol error codes;
 - `ProtocolError.Cause` and error unwrapping.
 
-The existing `NewServerProtocol` signature and base `ClientProtocol` workflow remain intact.
+The base `ClientProtocol` workflow remains intact. Before first external use,
+the `NewServerProtocol` positional dependencies were replaced by the structured
+`ServerDependencies` parameter and the low-level entry was renamed to
+`ProcessFrame`; no wire or protocol behavior changed.
 The final safety pass intentionally changes the `ReplayStore.Replay` and
 `StateSnapshotProvider.Snapshot` interfaces to receive materialization limits.
 Custom implementations must accept and enforce those bounds.

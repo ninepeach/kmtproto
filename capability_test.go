@@ -146,7 +146,13 @@ func TestCapabilityHandshakeStoresSessionState(t *testing.T) {
 	serverConfig.Clock = clock
 	serverConfig.Capabilities = registry
 	serverConfig.NewSessionID = func() (string, error) { return "s_cap", nil }
-	server, err := NewServerProtocol(serverConfig, sessions, NewMemoryDedupStore(clock, serverConfig.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(serverConfig, ServerDependencies{
+		Sessions:    sessions,
+		Dedup:       NewMemoryDedupStore(clock, serverConfig.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,13 +277,19 @@ func TestRequiredCapabilityFailureDoesNotCreateSession(t *testing.T) {
 		created = true
 		return "must_not_exist", nil
 	}
-	server, err := NewServerProtocol(config, sessions, NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, ServerDependencies{
+		Sessions:    sessions,
+		Dedup:       NewMemoryDedupStore(clock, config.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	outbound := NewOutboundQueue()
 	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{Capabilities: []CapabilityOffer{{Name: CapabilityStateSync, Versions: []uint16{CapabilityStateSyncVersion}, Required: true}}})}
-	if err := server.HandleIncoming(context.Background(), hello, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), hello, outbound); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, outbound)

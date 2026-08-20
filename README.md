@@ -56,6 +56,15 @@ QUIC connections. Transport lifecycle remains caller-owned, and `SingleWriter`
 is the only reference helper that serializes bytes to a caller-provided
 `ByteSender`.
 
+Normal server-side integration is intentionally layered:
+
+```text
+caller-owned transport
+    -> ServerAdmission.Handle       (HELLO-first, state, generation fencing)
+    -> ServerProtocol               (low-level Frame processing)
+    -> OutboundQueue
+```
+
 ## Minimal client flow
 
 ```go
@@ -82,6 +91,27 @@ retryActions, err := client.RetryPending()
 ```
 
 ## ServerProtocol boundary
+
+Required collaborators are grouped explicitly:
+
+```go
+server, err := kmtproto.NewServerProtocol(config, kmtproto.ServerDependencies{
+    Sessions:    sessions,
+    Dedup:       dedup,
+    Replay:      replay,
+    Appender:    appender,
+    Application: app,
+})
+
+admission := kmtproto.NewServerAdmission()
+generation, outbound := admission.Replace()
+err = admission.Handle(ctx, server, generation, frame)
+```
+
+`ServerProtocol.ProcessFrame` is available as a low-level processor for callers
+that deliberately provide equivalent admission themselves. It does not enforce
+HELLO-first connection state or generation fencing. Normal transport adapters
+should use `ServerAdmission.Handle`.
 
 `ApplicationHandler` receives the protocol message ID as its idempotency key:
 

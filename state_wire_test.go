@@ -128,7 +128,13 @@ func newStateSyncTestServer(t *testing.T, stateStore StateStore) (*ServerProtoco
 	config.NewSessionID = func() (string, error) { return "s_state", nil }
 	config.NewFrameID = func() (string, error) { return "resume_snapshot_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, config.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +151,7 @@ func createStateSyncTestSession(t *testing.T, server *ServerProtocol) {
 			{Name: CapabilityStateSync, Versions: []uint16{1}, Required: true},
 		}}),
 	}
-	if err := server.HandleIncoming(context.Background(), hello, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), hello, outbound); err != nil {
 		t.Fatal(err)
 	}
 	if welcome := nextTestFrame(t, outbound); welcome.Type != FrameWelcome || welcome.SessionID != "s_state" {
@@ -173,7 +179,7 @@ func TestStateQueryWireAndServerSnapshot(t *testing.T) {
 	}
 
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), query, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), query, outbound); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := nextTestFrame(t, outbound)
@@ -217,7 +223,7 @@ func TestStateQueryStopsAccumulatingAtSnapshotByteLimit(t *testing.T) {
 		Payload: mustPayload(StateQueryPayload{Namespace: "message", ObjectIDs: []string{"a", "b", "c"}}),
 	}
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), query, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), query, outbound); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, outbound)
@@ -362,7 +368,7 @@ func TestStateFramesRequireNegotiatedCapability(t *testing.T) {
 		Payload:   mustPayload(StateQueryPayload{Namespace: "message", ObjectIDs: []string{"msg001"}}),
 	}
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), query, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), query, outbound); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, outbound)

@@ -42,6 +42,17 @@ type ServerConfig struct {
 	FailureInjector  FailureInjector
 }
 
+// ServerDependencies contains the required protocol-facing collaborators for
+// ServerProtocol. Implementations decide their own persistence and runtime
+// policies; ServerProtocol only relies on their documented contracts.
+type ServerDependencies struct {
+	Sessions    SessionRepository
+	Dedup       ServerSessionStore
+	Replay      ReplayStore
+	Appender    EventAppender
+	Application ApplicationHandler
+}
+
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
 		Clock:            RealClock{},
@@ -109,9 +120,10 @@ type serverHandleResult struct {
 	abandonSession bool
 }
 
-// NewServerProtocol creates a server-side protocol frame processor/state
-// machine. It does not create or own a network listener or connection.
-func NewServerProtocol(config ServerConfig, sessions SessionRepository, dedup ServerSessionStore, replay ReplayStore, appender EventAppender, app ApplicationHandler) (*ServerProtocol, error) {
+// NewServerProtocol creates a low-level server-side protocol frame processor.
+// It does not create or own a network listener or connection. Normal transport
+// integrations should pass inbound frames through ServerAdmission.
+func NewServerProtocol(config ServerConfig, deps ServerDependencies) (*ServerProtocol, error) {
 	if config.Clock == nil {
 		config.Clock = RealClock{}
 	}
@@ -152,24 +164,50 @@ func NewServerProtocol(config ServerConfig, sessions SessionRepository, dedup Se
 	if config.NewFrameID == nil {
 		config.NewFrameID = DefaultFrameIDGenerator(config.Clock)
 	}
-	if sessions == nil || dedup == nil || replay == nil || appender == nil || app == nil {
-		return nil, errors.New("kmtproto: server dependencies are required")
+	if deps.Sessions == nil {
+		return nil, errors.New("kmtproto: ServerDependencies.Sessions is required")
 	}
-	if reporter, ok := dedup.(DedupRetentionReporter); ok {
+	if deps.Dedup == nil {
+		return nil, errors.New("kmtproto: ServerDependencies.Dedup is required")
+	}
+	if deps.Replay == nil {
+		return nil, errors.New("kmtproto: ServerDependencies.Replay is required")
+	}
+	if deps.Appender == nil {
+		return nil, errors.New("kmtproto: ServerDependencies.Appender is required")
+	}
+	if deps.Application == nil {
+		return nil, errors.New("kmtproto: ServerDependencies.Application is required")
+	}
+	if reporter, ok := deps.Dedup.(DedupRetentionReporter); ok {
 		retention := reporter.DedupRetentionTTL()
 		if retention < config.ClientRetryTTL || retention < config.SessionResumeTTL {
 			return nil, errors.New("kmtproto: dedup store retention must cover ClientRetryTTL and SessionResumeTTL")
 		}
 	}
-	return &ServerProtocol{config: config, sessions: sessions, dedup: dedup, replay: replay, appender: appender, app: app, flights: make(map[string]*sendFlight), lanes: make(map[string]*streamLane)}, nil
+	return &ServerProtocol{
+		config:   config,
+		sessions: deps.Sessions,
+		dedup:    deps.Dedup,
+		replay:   deps.Replay,
+		appender: deps.Appender,
+		app:      deps.Application,
+		flights:  make(map[string]*sendFlight),
+		lanes:    make(map[string]*streamLane),
+	}, nil
 }
 
-func (s *ServerProtocol) HandleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
-	_, err := s.handleIncoming(ctx, frame, outbound)
+// ProcessFrame processes one already-admitted protocol Frame. It is a low-level
+// processor: it does not own a network connection, manage transport lifecycle,
+// enforce HELLO-first connection state, or apply connection-generation
+// fencing. Normal transport integrations should call ServerAdmission.Handle,
+// which performs per-connection admission before invoking ServerProtocol.
+func (s *ServerProtocol) ProcessFrame(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
+	_, err := s.processFrame(ctx, frame, outbound)
 	return err
 }
 
-func (s *ServerProtocol) handleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+func (s *ServerProtocol) processFrame(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
 	if outbound == nil {
 		return serverHandleResult{}, errors.New("kmtproto: nil outbound queue")
 	}
@@ -954,10 +992,13 @@ func invokeStreamRequest(fn func() error) (err error) {
 	return fn()
 }
 
-// ServerAdmission is a concurrency-safe reference protocol admission gate with
-// generation fencing. It tracks handshake/admission state for a caller-owned
+// ServerAdmission is a concurrency-safe per-connection protocol admission gate
+// with generation fencing. It enforces HELLO-first, connection protocol state,
+// Session correlation, and allowed-frame validation before invoking the
+// low-level ServerProtocol processor. It tracks state for a caller-owned
 // transport connection generation, but does not represent or own a network
-// connection and performs no transport I/O.
+// connection and performs no transport I/O; transport lifecycle remains
+// caller-owned.
 type ServerAdmission struct {
 	mu           sync.Mutex
 	generation   ConnectionGeneration
@@ -1055,6 +1096,11 @@ func (c *ServerAdmission) CapabilityVersion(name string) (version uint16, ok boo
 	return c.capabilities.Version(name)
 }
 
+// Handle admits and processes one inbound Frame for the current caller-owned
+// transport generation. It enforces HELLO-first connection protocol state,
+// Session correlation, allowed-frame rules, and generation fencing before
+// invoking ServerProtocol. It performs no network I/O and does not own the
+// transport lifecycle.
 func (c *ServerAdmission) Handle(ctx context.Context, server *ServerProtocol, generation ConnectionGeneration, frame Envelope) error {
 	if server == nil {
 		return errors.New("kmtproto: nil server")
@@ -1073,7 +1119,7 @@ func (c *ServerAdmission) Handle(ctx context.Context, server *ServerProtocol, ge
 	}
 	if err := ValidateFrame(&frame, server.config.Limits, server.config.StrictValidation); err != nil {
 		c.mu.Unlock()
-		result, handleErr := invokeServerHandle(ctx, server, frame, outbound)
+		result, handleErr := invokeServerProcess(ctx, server, frame, outbound)
 		c.applyResult(generation, outbound, result)
 		return handleErr
 	}
@@ -1096,12 +1142,12 @@ func (c *ServerAdmission) Handle(ctx context.Context, server *ServerProtocol, ge
 	}
 	c.mu.Unlock()
 
-	result, err := invokeServerHandle(ctx, server, frame, outbound)
+	result, err := invokeServerProcess(ctx, server, frame, outbound)
 	c.applyResult(generation, outbound, result)
 	return err
 }
 
-func invokeServerHandle(ctx context.Context, server *ServerProtocol, frame Envelope, outbound *OutboundQueue) (result serverHandleResult, err error) {
+func invokeServerProcess(ctx context.Context, server *ServerProtocol, frame Envelope, outbound *OutboundQueue) (result serverHandleResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			outbound.Close()
@@ -1109,7 +1155,7 @@ func invokeServerHandle(ctx context.Context, server *ServerProtocol, frame Envel
 			err = fmt.Errorf("kmtproto: server dependency panicked: %v", recovered)
 		}
 	}()
-	return server.handleIncoming(ctx, frame, outbound)
+	return server.processFrame(ctx, frame, outbound)
 }
 
 func (c *ServerAdmission) applyResult(generation ConnectionGeneration, outbound *OutboundQueue, result serverHandleResult) {
