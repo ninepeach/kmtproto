@@ -69,8 +69,8 @@ The current package already has the right architectural primitives:
 
 - typed Envelope and payloads;
 - strict bounded JSON Codec;
-- a mutex-protected Client state machine that returns Actions;
-- a transport-independent Server;
+- a mutex-protected `ClientProtocol` state machine that returns Actions;
+- a transport-independent `ServerProtocol` frame processor/state machine;
 - generation fencing;
 - single outbound serialization;
 - atomic SEND Claim/Complete contracts;
@@ -178,7 +178,7 @@ State snapshots are not embedded in RESUME and are not EVENT Replay items.
 
 ### 2.7 Concurrency and I/O
 
-- Client and Server state mutation remains serialized;
+- `ClientProtocol` and `ServerProtocol` state mutation remains serialized;
 - no lock spans network I/O, storage I/O, Application callbacks, or user
   callbacks;
 - all output for one connection passes through one writer;
@@ -228,7 +228,7 @@ Planned changes:
 - retain `seq` exclusively for EVENT;
 - keep Codec interface unchanged;
 - update strict JSON validation and encoded/decoded limits;
-- inject an ID generator through Client/Server configuration so tests never
+- inject an ID generator through `ClientProtocol`/`ServerProtocol` configuration so tests never
   depend on random IDs.
 
 Validation must be separated into two layers:
@@ -237,7 +237,7 @@ Validation must be separated into two layers:
    and context-free invariants; safe for Codec Encode/Decode;
 2. **protocol admission** — connection state, generation, Session ownership,
    accepted Capability, negotiated directional limits, and request
-   correlation; performed by Client/Server state machines.
+   correlation; performed by `ClientProtocol`/`ServerProtocol` state machines.
 
 The Codec must not require mutable Session state. The SingleWriter may rely on
 frames being admission-validated before enqueue, but still performs structural
@@ -266,7 +266,7 @@ Capability naming validation:
 
 Capability storage:
 
-- Client offers live in immutable Client configuration or handshake options;
+- Client offers live in immutable `ClientProtocol` configuration or handshake options;
 - server-supported specifications live in a registry constructed before the
   Server begins handling frames;
 - the registry is process-local, read-only after construction, and safe for
@@ -368,7 +368,7 @@ the gap.
 
 #### Server handshake flow
 
-ServerConnection remains a minimal admission helper:
+ServerAdmission remains a minimal admission helper:
 
 ```text
 AWAITING_HELLO -> NEGOTIATING -> READY
@@ -610,7 +610,7 @@ Snapshot generation should:
 - concurrent reads return defensive copies;
 - property tests prove cached version never decreases.
 
-Exit gate: State Core can be tested without Envelope, Client connection, Server,
+Exit gate: State Core can be tested without Envelope, `ClientProtocol`, `ServerProtocol`,
 or network helpers.
 
 ### Phase 4 — State Frames
@@ -691,10 +691,10 @@ SEND, and missed live State is repaired by a future query.
 
 Likely additions:
 
-- a Client command to issue an exact-ID State query;
+- a `ClientProtocol` command to issue an exact-ID State query;
 - an Action reporting a completed snapshot;
 - an Action reporting an installed State replacement or tombstone;
-- a Server method to publish an already committed State Object;
+- a `ServerProtocol` method to publish an already committed State Object;
 - a server-side query handler boundary that loads exact IDs after admission.
 
 Actions contain immutable copies. They never execute Application callbacks.
@@ -912,7 +912,7 @@ Required validation layers:
 
 1. **Wire fixtures** — canonical valid and invalid JSON for all frames.
 2. **Unit tests** — validators, registry, limits, State merge, error behavior.
-3. **State-transition tests** — all legal and illegal Client/Server transitions.
+3. **State-transition tests** — all legal and illegal `ClientProtocol`/`ServerProtocol` transitions.
 4. **Invariant/property tests** — independent EVENT and State monotonicity.
 5. **Concurrency/race tests** — handshake, queries, updates, Resume, SEND.
 6. **Failure injection** — storage/callback/enqueue failures and generation
@@ -988,10 +988,10 @@ Test files should follow concepts rather than accumulate all cases in one file:
 - `state_test.go`;
 - `state_cache_test.go`;
 - `resume_v2_test.go`;
-- existing Client, Server, Codec, queue, race, and hardening tests updated for v2.
+- existing `ClientProtocol`, `ServerProtocol`, Codec, queue, race, and hardening tests updated for v2.
 
 Reference helpers such as Memory stores, OutboundQueue, SingleWriter, and
-ServerConnection remain optional process-local helpers. Do not add cluster,
+ServerAdmission remains an optional process-local helper. Do not add cluster,
 persistence, routing, or network lifecycle responsibilities to them.
 
 ## 5. Public API changes
@@ -1006,17 +1006,17 @@ Expected breaking changes:
 - ACK, PONG, and ERROR payload correlation fields disappear;
 - HELLO/WELCOME payloads and WELCOME modes change;
 - RESUME receives an explicit RESUME_OK response;
-- Client's separate v0.1 StartSession/Resume entry should become one HELLO-first
+- `ClientProtocol`'s separate v0.1 StartSession/Resume entry should become one HELLO-first
   handshake command;
 - ClientConfig gains client metadata, Capability Offers, receive limits, Frame
   ID generation, and State cache/query limits;
 - ServerConfig gains supported capabilities, directional limit policy, and
   Frame ID generation;
-- Server construction needs State query dependencies without repeatedly
+- `ServerProtocol` construction needs State query dependencies without repeatedly
   lengthening positional arguments;
 - SessionRepository evolves from existence checks to protocol Session metadata;
-- Client gains State query/accessor commands;
-- Server gains committed State publication;
+- `ClientProtocol` gains State query/accessor commands;
+- `ServerProtocol` gains committed State publication;
 - Actions gain immutable negotiation and State results.
 
 To limit future churn:
@@ -1241,13 +1241,13 @@ and Phase 6 generation-fenced Resume.
 ### Blocking before Phase 0
 
 1. Is every Frame ID globally unique? Recommendation: yes, generated as ULID.
-2. What exact public Client handshake API replaces StartSession/Resume?
-   Recommendation: one HELLO-first command that uses the Client's current
+2. What exact public `ClientProtocol` handshake API replaces StartSession/Resume?
+   Recommendation: one HELLO-first command that uses `ClientProtocol`'s current
    Session ID.
 3. Which capabilities are resume-critical Session requirements?
    Recommendation: each CapabilitySpec declares this; do not persist all
    accepted optional capabilities automatically.
-4. Does the initial Server constructor move to a ServerDependencies struct?
+4. Does the initial `ServerProtocol` constructor move to a ServerDependencies struct?
    Recommendation: yes, to avoid repeated positional breaking changes.
 
 ### Blocking before Phase 3

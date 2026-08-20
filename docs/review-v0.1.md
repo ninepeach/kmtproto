@@ -19,7 +19,7 @@ errors, deterministic actions, and reference in-memory helpers.
 KMTProto is not a WebSocket or TCP server, gateway, database, distributed
 session manager, cluster coordinator, message queue, authentication system, or
 business router. The in-memory stores, outbound queue, single writer, and
-`ServerConnection` are reference/helper implementations. They are not
+`ServerAdmission` are reference/helper implementations. They are not
 production runtime requirements of the wire protocol.
 
 The requested review named files such as `frame.go`, `session.go`,
@@ -36,9 +36,9 @@ the behavior and tests are reviewed instead.
 | Envelope and typed protocol payloads | `types.go`, `payload.go` | JSON round trips and frame validation | Presence of zero-valued resume fields is not enforced |
 | Strict protocol validation with bounded input | `json_codec.go`, `validate.go`, `limits.go` | Malformed JSON, strict fields, and common size limits | Outbound builders do not consistently validate before mutating state |
 | Deterministic client state machine | `client.go` with mutex-protected transitions and actions | Happy paths, gap, resume, heartbeat | State-transition matrix is incomplete; invalid PONG can be silently ignored |
-| Server-side protocol state | `ServerConnection` fences generation and serializes output | Generation and serialization tests | HELLO/RESUME/READY frame admission is not represented explicitly |
-| Connection-generation fencing | `Client.HandleIncoming` and `ServerConnection.Handle` compare generation | Old EVENT/PONG/ERROR tests | Old WELCOME and state-mutation matrix need explicit tests |
-| Reliable SEND and ACK boundary | `Server.handleSend` calls Claim, Application, Complete, then enqueues ACK | SEND, duplicate, failure injection | ACK order is correct; needs an explicit ordering invariant test |
+| Server-side protocol state | `ServerAdmission` fences generation and serializes output | Generation and serialization tests | HELLO/RESUME/READY frame admission is not represented explicitly |
+| Connection-generation fencing | `ClientProtocol.HandleIncoming` and `ServerAdmission.Handle` compare generation | Old EVENT/PONG/ERROR tests | Old WELCOME and state-mutation matrix need explicit tests |
+| Reliable SEND and ACK boundary | `ServerProtocol.handleSend` calls Claim, Application, Complete, then enqueues ACK | SEND, duplicate, failure injection | ACK order is correct; needs an explicit ordering invariant test |
 | Atomic `(session_id, msg_id)` dedup | `ServerSessionStore.Claim/Complete/Abort`; `MemoryDedupStore` | Duplicate and concurrent duplicate tests | Active PROCESSING entries can expire, permitting a second execution |
 | Deterministic duplicate PROCESSING behavior | Server in-flight registry waits for the local leader | Concurrent duplicate test | Claim occurs before flight registration, leaving a nondeterministic window |
 | Application idempotency boundary | `msgID` is passed to `ApplicationHandler` | Handler tests observe ID | End-to-end exactly-once limitation and global uniqueness expectation need clearer docs |
@@ -117,7 +117,7 @@ silently accepted.
 
 #### H-3: server connection admission state is implicit
 
-`ServerConnection` provides generation fencing and serialized output but does
+`ServerAdmission` provides generation fencing and serialized output but does
 not model awaiting-handshake versus ready states. Consequently, SEND or PING can
 reach the low-level handler before HELLO/RESUME, and a second HELLO can be
 accepted after readiness when used through the helper.
@@ -257,9 +257,9 @@ Migration details:
 
 - Zero-valued new replay configuration fields select documented defaults, so
   existing `ClientConfig` and `ServerConfig` construction continues to work.
-- Callers using `ServerConnection` must complete HELLO or RESUME before passing
+- Callers using `ServerAdmission` must complete HELLO or RESUME before passing
   PING/SEND. Callers that intentionally provide their own admission state may
-  continue to use the lower-level `Server.HandleIncoming` frame processor.
+  continue to use the lower-level `ServerProtocol.HandleIncoming` frame processor.
 - RESUMED WELCOME encoders must include both `resume_from` and `replay_to`, even
   when `replay_to` is zero. NEW WELCOME must omit both fields.
 - Only HELLO may carry an optional envelope ID among non-reliable frames. PING,
@@ -281,7 +281,7 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 | C-1 | Resolved | PROCESSING survives TTL; `TestProcessingDedupClaimDoesNotExpire` |
 | H-1 | Resolved | Flight precedes Claim; `TestDuplicateBindsToFlightBeforeClaim` |
 | H-2 | Resolved | Event/byte replay limits and bounded identity window; `TestClientReplayLimitsDoNotAdvanceSequence`, `TestEventIdentityWindowIsBoundedAndConservative` |
-| H-3 | Resolved | Generation-fenced `ServerConnection` admission state; `TestServerConnectionAdmissionState`, `TestServerConnectionReplacementFencesLateHandshake` |
+| H-3 | Resolved | Generation-fenced `ServerAdmission` admission state; `TestServerAdmissionState`, `TestServerAdmissionReplacementFencesLateHandshake` |
 | H-4 | Resolved | Separate sequence high-water and exhaustion guard; `TestReplayHighWaterSurvivesFullPrune` |
 | H-5 | Resolved | Explicit RESUMED boundary encoding/presence validation; `TestResumedWelcomeCarriesExplicitBounds` |
 | M-1 | Resolved | PONG requires READY/SUSPECT; `TestInvalidClientStateTransitionsAndOldWelcome` |
@@ -290,7 +290,7 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 | M-4 | Resolved | Complete outbound validation precedes client mutation; `TestOutboundValidationPrecedesClientMutation` |
 | M-5 | Resolved | Invariant and failure-window suite in `hardening_test.go` |
 | M-6 | Resolved | `ServerConfig.MaxReplayEvents`; `TestServerReplayEventLimitReturnsSyncRequired` |
-| L-1 | Accepted | Documented compatibility behavior: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServer` derives it from that clock |
+| L-1 | Accepted | Documented compatibility behavior: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServerProtocol` derives it from that clock |
 | L-2 | Accepted / Out of Scope | Helper queues/outbox are documented as process-local; replay-specific memory is bounded, while production backpressure and persistence belong to the runtime |
 
 - Remaining Critical findings: **0**
@@ -299,10 +299,10 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 ## Final public API assessment
 
 The hardening is additive at the Go API level: replay-limit configuration,
-error disposition, and reference `ServerConnection` state were added without
+error disposition, and reference `ServerAdmission` state were added without
 removing frame types, exported method signatures, or application/store
 interfaces. The stricter RESUMED WELCOME representation, forbidden envelope
-IDs, fixed ERROR retryability, and `ServerConnection` admission checks are
+IDs, fixed ERROR retryability, and `ServerAdmission` admission checks are
 intentional v0.1 wire/state correctness tightenings. Their migration impact is
 listed in Compatibility notes above.
 

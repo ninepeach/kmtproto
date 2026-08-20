@@ -44,7 +44,7 @@ type ServerSessionStore interface {
 }
 
 // DedupRetentionReporter lets a store expose its completed-record retention so
-// NewServer can verify it against configured retry and Resume windows. Stores
+// NewServerProtocol can verify it against configured retry and Resume windows. Stores
 // that do not implement this interface still MUST satisfy ServerSessionStore's
 // retention contract.
 type DedupRetentionReporter interface {
@@ -155,11 +155,12 @@ func (s *MemoryDedupStore) DedupRetentionTTL() time.Duration {
 func dedupKey(sessionID, msgID string) string { return sessionID + "\x00" + msgID }
 
 func (s *MemoryDedupStore) Claim(sessionID, msgID string, fingerprint SendFingerprint) (bool, *DedupRecord, error) {
+	now := s.clock.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := dedupKey(sessionID, msgID)
 	if entry, ok := s.records[key]; ok {
-		if entry.record.State == DedupProcessing || s.clock.Now().Before(entry.expiresAt) {
+		if entry.record.State == DedupProcessing || now.Before(entry.expiresAt) {
 			r := entry.record
 			if r.Ack != nil {
 				ack := copyEnvelope(*r.Ack)
@@ -169,7 +170,7 @@ func (s *MemoryDedupStore) Claim(sessionID, msgID string, fingerprint SendFinger
 		}
 		delete(s.records, key)
 	}
-	s.records[key] = memoryDedupEntry{record: DedupRecord{State: DedupProcessing, Fingerprint: fingerprint}, expiresAt: s.clock.Now().Add(s.ttl)}
+	s.records[key] = memoryDedupEntry{record: DedupRecord{State: DedupProcessing, Fingerprint: fingerprint}, expiresAt: now.Add(s.ttl)}
 	return true, nil, nil
 }
 
@@ -177,6 +178,7 @@ func (s *MemoryDedupStore) Complete(sessionID, msgID string, ack *Envelope) erro
 	if ack == nil {
 		return errors.New("kmtproto: nil ACK")
 	}
+	now := s.clock.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := dedupKey(sessionID, msgID)
@@ -186,7 +188,7 @@ func (s *MemoryDedupStore) Complete(sessionID, msgID string, ack *Envelope) erro
 	}
 	copyAck := copyEnvelope(*ack)
 	entry.record = DedupRecord{State: DedupCompleted, Fingerprint: entry.record.Fingerprint, Ack: &copyAck}
-	entry.expiresAt = s.clock.Now().Add(s.ttl)
+	entry.expiresAt = now.Add(s.ttl)
 	s.records[key] = entry
 	return nil
 }

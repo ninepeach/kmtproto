@@ -241,8 +241,8 @@ func TestV02ProtocolLimitsApplyBeforeProcessing(t *testing.T) {
 
 	clientConfig := DefaultClientConfig()
 	clientConfig.Limits.MaxIDLength = -1
-	if _, err := NewClient(clientConfig); err == nil {
-		t.Fatal("NewClient accepted a negative protocol limit")
+	if _, err := NewClientProtocol(clientConfig); err == nil {
+		t.Fatal("NewClientProtocol accepted a negative protocol limit")
 	}
 }
 

@@ -26,22 +26,22 @@ func main() {
 	serverConfig := kmtproto.DefaultServerConfig()
 	serverConfig.Clock = clock
 	serverConfig.NewSessionID = func() (string, error) { return "s_demo", nil }
-	server, mustErr := kmtproto.NewServer(serverConfig, sessions, dedup, replay, replay, assistantApp{})
+	server, mustErr := kmtproto.NewServerProtocol(serverConfig, sessions, dedup, replay, replay, assistantApp{})
 	must(mustErr)
 
 	clientConfig := kmtproto.DefaultClientConfig()
 	clientConfig.Clock = clock
-	client, mustErr := kmtproto.NewClient(clientConfig)
+	client, mustErr := kmtproto.NewClientProtocol(clientConfig)
 	must(mustErr)
 
-	connection := kmtproto.NewServerConnection()
-	serverGeneration, serverOutbound := connection.Replace()
+	admission := kmtproto.NewServerAdmission()
+	serverGeneration, serverOutbound := admission.Replace()
 	clientGeneration := client.BeginConnect()
 	must(client.TransportConnected(clientGeneration))
 
 	helloActions, mustErr := client.StartSession(clientGeneration, "example-client")
 	must(mustErr)
-	must(connection.Handle(ctx, server, serverGeneration, sendFrame(helloActions)))
+	must(admission.Handle(ctx, server, serverGeneration, sendFrame(helloActions)))
 	welcome := next(ctx, serverOutbound)
 	readyActions, mustErr := client.HandleIncoming(clientGeneration, welcome)
 	must(mustErr)
@@ -49,7 +49,7 @@ func main() {
 
 	sendActions, mustErr := client.EnqueueSend("msg_01", json.RawMessage(`{"text":"hello protocol"}`))
 	must(mustErr)
-	must(connection.Handle(ctx, server, serverGeneration, sendFrame(sendActions)))
+	must(admission.Handle(ctx, server, serverGeneration, sendFrame(sendActions)))
 	ack := next(ctx, serverOutbound)
 	acked, mustErr := client.HandleIncoming(clientGeneration, ack)
 	must(mustErr)
@@ -65,12 +65,12 @@ func main() {
 	must(client.Disconnect(clientGeneration))
 	must(server.PublishEvent(client.SessionID(), "evt_02", "message.new", json.RawMessage(`{"text":"while offline"}`), serverOutbound))
 
-	serverGeneration, serverOutbound = connection.Replace()
+	serverGeneration, serverOutbound = admission.Replace()
 	clientGeneration = client.BeginConnect()
 	must(client.TransportConnected(clientGeneration))
 	resumeActions, mustErr := client.Resume(clientGeneration)
 	must(mustErr)
-	must(connection.Handle(ctx, server, serverGeneration, sendFrame(resumeActions)))
+	must(admission.Handle(ctx, server, serverGeneration, sendFrame(resumeActions)))
 
 	resumeWelcome := next(ctx, serverOutbound)
 	_, mustErr = client.HandleIncoming(clientGeneration, resumeWelcome)

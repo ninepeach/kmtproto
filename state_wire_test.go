@@ -78,13 +78,13 @@ func (s *testStateStore) Snapshot(_ context.Context, namespaces []string, limits
 	return append([]StateObject(nil), accumulator.states...), nil
 }
 
-func readyStateSyncClient(t *testing.T) (*Client, *FakeClock, ConnectionGeneration) {
+func readyStateSyncClient(t *testing.T) (*ClientProtocol, *FakeClock, ConnectionGeneration) {
 	t.Helper()
 	clock := NewFakeClock(time.Unix(1_000, 0))
 	config := DefaultClientConfig()
 	config.Clock = clock
 	config.Capabilities = []CapabilityOffer{{Name: CapabilityStateSync, Versions: []uint16{1}, Required: true}}
-	client, err := NewClient(config)
+	client, err := NewClientProtocol(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func readyStateSyncClient(t *testing.T) (*Client, *FakeClock, ConnectionGenerati
 	return client, clock, generation
 }
 
-func newStateSyncTestServer(t *testing.T, stateStore StateStore) (*Server, *FakeClock, *MemoryReplayStore) {
+func newStateSyncTestServer(t *testing.T, stateStore StateStore) (*ServerProtocol, *FakeClock, *MemoryReplayStore) {
 	t.Helper()
 	clock := NewFakeClock(time.Unix(1_100, 0))
 	registry, err := NewCapabilityRegistry([]CapabilitySpec{{Name: CapabilityStateSync, Versions: []uint16{1}}}, DefaultLimits())
@@ -128,14 +128,14 @@ func newStateSyncTestServer(t *testing.T, stateStore StateStore) (*Server, *Fake
 	config.NewSessionID = func() (string, error) { return "s_state", nil }
 	config.NewFrameID = func() (string, error) { return "resume_snapshot_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return server, clock, replay
 }
 
-func createStateSyncTestSession(t *testing.T, server *Server) {
+func createStateSyncTestSession(t *testing.T, server *ServerProtocol) {
 	t.Helper()
 	outbound := NewOutboundQueue()
 	hello := Envelope{

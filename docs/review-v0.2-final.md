@@ -43,7 +43,7 @@ matrix passes against the exact working-tree candidate.
 | Finding | Resolution |
 |---|---|
 | C-01 wire/version ambiguity | **Resolved**: `WireVersionV2=2` is the only accepted baseline; `docs/protocol-v0.2.md` is normative; README/package/history docs point to it |
-| C-02 READY Gap Resume rejected | **Resolved**: same-session RESUME transitions `ServerConnection` READY -> RESUMING -> READY; end-to-end test covers Client gap through the reference gate |
+| C-02 READY Gap Resume rejected | **Resolved**: same-session RESUME transitions `ServerAdmission` READY -> RESUMING -> READY; end-to-end test covers ClientProtocol gap through the reference gate |
 | H-01 unbounded server Replay bytes | **Resolved**: `ServerConfig.MaxReplayBytes` and `ReplayLimits` bound store materialization; overflow returns `SYNC_REQUIRED` |
 | H-02 late State response limits | **Resolved**: query snapshots accumulate with count/byte bounds; Resume providers receive `StateSnapshotLimits` before materialization; failures are protocol ERRORs |
 | H-03 re-entrant stream deadlock | **Resolved**: active callback re-entry returns `ErrStreamCallbackActive`; deterministic retry and re-entry tests cover the contract |
@@ -104,8 +104,8 @@ An unknown optional capability is omitted. An unsupported required capability
 returns `UNSUPPORTED_FEATURE`, creates no Session, and closes. Malformed or
 duplicate capability declarations return `INVALID_CAPABILITY`.
 
-The accepted result is copied into `SessionState`, Client state, and
-`ServerConnection` state. Public query methods return defensive copies, and
+The accepted result is copied into `SessionState`, `ClientProtocol` state, and
+`ServerAdmission` state. Public query methods return defensive copies, and
 RESUME reuses the Session result rather than renegotiating it.
 
 ### 2.3 Reliable SEND/ACK
@@ -197,7 +197,7 @@ normative v0.2 specification:
 1. Wire Version 2 is the only accepted v0.2 baseline; Wire Version 1 is rejected
    with `UNSUPPORTED_VERSION`.
 2. A logical Session may outlive transport generations.
-3. Stale generations cannot mutate active Client or `ServerConnection` state.
+3. Stale generations cannot mutate active `ClientProtocol` or `ServerAdmission` state.
 4. Negotiated capabilities are immutable for the logical Session.
 5. An unsupported required capability never creates a Session.
 6. `(session_id, msg_id)` is the protocol SEND dedup identity.
@@ -251,13 +251,13 @@ the proposed Wire Version 2 baseline, then publish one normative
 compatibility fixtures. This is a version-contract decision, not a request to
 add features.
 
-#### C-02 — EVENT-gap RESUME conflicts with `ServerConnection` admission
+#### C-02 — EVENT-gap RESUME conflicts with `ServerAdmission` admission
 
 **Resolved.** The text below records the original finding.
 
-`Client.handleEventLocked` handles `incoming.seq > last_seq+1` by entering
+`ClientProtocol.handleEventLocked` handles `incoming.seq > last_seq+1` by entering
 RESUMING and immediately returning a RESUME frame on the active connection.
-`ServerConnection.Handle`, however, allows RESUME only while
+`ServerAdmission.Handle`, however, allows RESUME only while
 `AWAITING_HANDSHAKE`; its READY allow-list is PING, SEND, and STATE_QUERY.
 Therefore a caller using the reference admission gate will reject the Client's
 documented gap recovery with `PROTOCOL_VIOLATION` and close the connection.
@@ -268,7 +268,7 @@ admission separately, but do not connect these two paths.
 Freeze requirement: make one existing semantic authoritative—either admit
 RESUME from READY for same-connection gap recovery or require reconnect before
 the Client emits RESUME—and add an end-to-end state-transition test through
-`ServerConnection`.
+`ServerAdmission`.
 
 ### High
 
@@ -350,7 +350,7 @@ Freeze requirement: trim whitespace before the null check and add direct
 
 The suite is broad, but freeze coverage is missing for:
 
-- Client gap RESUME through a READY `ServerConnection`;
+- ClientProtocol gap RESUME through a READY `ServerAdmission`;
 - server Replay total-byte exhaustion;
 - oversized multi-object State response disposition;
 - duplicate JSON members and whitespace-null payloads;
@@ -403,8 +403,8 @@ database, connection registry, or cluster runtime.
 
 Client methods are mutex-protected and return Actions instead of executing
 transport/Application callbacks. Server flight and Session-lane mutexes are
-released before Application and Store calls. `ServerConnection` releases its
-mutex before invoking the Server. Memory helpers and `OutboundQueue` document
+released before Application and Store calls. `ServerAdmission` releases its
+mutex before invoking `ServerProtocol`. Memory helpers and `OutboundQueue` document
 process-local concurrent safety. `SingleWriter` explicitly requires one active
 Run call.
 
@@ -458,7 +458,7 @@ Most Phase 0–5 API changes are additive:
 - additional protocol error codes;
 - `ProtocolError.Cause` and error unwrapping.
 
-The existing `NewServer` signature and base Client workflow remain intact.
+The existing `NewServerProtocol` signature and base `ClientProtocol` workflow remain intact.
 The final safety pass intentionally changes the `ReplayStore.Replay` and
 `StateSnapshotProvider.Snapshot` interfaces to receive materialization limits.
 Custom implementations must accept and enforce those bounds.

@@ -28,7 +28,7 @@ not 2.
 KMTProto owns:
 
 - Envelope, Frame, codec, validation, and protocol limits;
-- Client and reference Server admission state transitions;
+- `ClientProtocol` state transitions and reference `ServerAdmission` state;
 - HELLO/WELCOME capability negotiation;
 - SEND/ACK reliability and idempotency contracts;
 - EVENT ordering, gap detection, Resume, and Replay;
@@ -39,7 +39,7 @@ KMTProto owns:
 Callers own transport lifecycle, authentication and authorization decisions,
 business meaning, persistence, distributed coordination, and all execution of
 Actions. Memory stores, `OutboundQueue`, `SingleWriter`, and
-`ServerConnection` are process-local reference helpers, not a production
+`ServerAdmission` are process-local reference helpers, not a production
 runtime requirement.
 
 ## 3. Envelope
@@ -106,7 +106,13 @@ renegotiate it. All feature checks use Session capability state. The built-in
 State Frames require capability `state-sync` version 1.
 
 Capability names are lower-case ASCII, start with a letter, and may contain
-letters, digits, and non-repeated internal `.` or `-` separators.
+letters, digits, and non-repeated internal `.` or `-` separators. Versions are
+positive numeric fields and MUST NOT be encoded into names such as
+`state-sync-v2`. The built-in State Frames implement exactly
+`{name:"state-sync", version:1}`; `ClientProtocol` and `ServerProtocol`
+configuration reject other
+versions for that built-in capability. Configuration is performed through
+`ClientProtocol` and `ServerProtocol` constructors.
 
 ## 6. Session and connection state
 
@@ -119,7 +125,7 @@ generation. Input tagged with an older generation returns
 `ErrStaleConnection` and MUST NOT mutate current Session, sequence, State, or
 heartbeat data.
 
-The reference `ServerConnection` admits HELLO/RESUME while awaiting handshake;
+The reference `ServerAdmission` admits HELLO/RESUME while awaiting handshake;
 PING, SEND, STATE_QUERY, and same-session RESUME while READY; and no normal
 traffic while RESUMING. Successful RESUME returns it to READY. A RESUME without
 explicit success leaves that connection closed or abandoned according to the
@@ -175,7 +181,7 @@ exactly `last_seq+1 ... replay_to`, with original ID, sequence, and payload.
 Live EVENTs produced while Replay is captured are serialized after the Replay
 batch. Partial Replay is buffered and never delivered to the Application.
 
-Client and Server enforce independent replay event and byte ceilings. A
+`ClientProtocol` and `ServerProtocol` enforce independent Replay event and byte ceilings. A
 Replay store receives `ReplayLimits` before materializing results. An
 unavailable retention window or exceeded safety limit produces
 `SYNC_REQUIRED`; `last_seq` does not advance.
@@ -221,7 +227,7 @@ Session negotiated `state-sync`. Server output order is:
 3. one STATE_SNAPSHOT for the requested namespaces.
 
 EVENT and State remain separate domains. State Frames use `seq=0`, do not enter
-Replay, and do not affect `last_seq`. The Client stages both phases and emits no
+Replay, and do not affect `last_seq`. `ClientProtocol` stages both phases and emits no
 Application delivery until they are complete. It then emits replayed EVENT
 actions, State-change actions, and finally READY. Any interruption discards
 staged Replay and retries from the last confirmed `last_seq`.
@@ -265,10 +271,13 @@ validation MUST never panic on malformed input.
 
 ## 14. Concurrency and storage contracts
 
-`Client`, `ServerConnection`, `MemoryDedupStore`, `MemoryReplayStore`,
+`ClientProtocol`, `ServerAdmission`, `MemoryDedupStore`, `MemoryReplayStore`,
 `MemorySessionRepository`, and `OutboundQueue` are safe for concurrent use in
-one process. `Server` is safe when injected dependencies satisfy their stated
-contracts. These guarantees do not imply multi-process or distributed safety.
+one process. `ServerProtocol` is safe when injected dependencies satisfy their
+stated contracts. `ClientProtocol` and `ServerProtocol` are protocol state
+machines/processors only: neither owns network connections, opens
+WebSocket/TCP/QUIC connections, or manages transport lifecycle. These
+guarantees do not imply multi-process or distributed safety.
 
 One Session stream lane serializes Replay, live EVENT, and live STATE output.
 Injected callbacks execute without protocol mutexes held. While an injected
@@ -285,9 +294,9 @@ distributed consistency remain implementation concerns.
 Session repositories MUST atomically reject duplicate Session IDs. Dedup
 stores MUST retain completed fingerprints and ACKs for at least the configured
 Client retry and Session Resume windows. Clock implementations are
-concurrency-safe, prompt value providers and MUST NOT synchronously call back
-into the protocol object invoking `Now`; this narrow value-provider contract is
-the only operation that may be sampled while a protocol state lock is held.
+concurrency-safe, prompt value providers. Protocol objects sample Clock values
+without holding their state/store mutexes; a synchronous Clock callback cannot
+deadlock by re-entering the invoking object.
 
 ## 15. Extension rules
 

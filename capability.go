@@ -3,6 +3,7 @@ package kmtproto
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -262,7 +263,24 @@ func validateCapabilityName(name string, limits Limits) error {
 	if separator {
 		return NewProtocolError(ErrorInvalidCapability, "invalid capability name: "+name)
 	}
+	parts := strings.FieldsFunc(name, func(r rune) bool { return r == '.' || r == '-' })
+	last := parts[len(parts)-1]
+	if len(last) > 1 && last[0] == 'v' && allASCIIDigits(last[1:]) {
+		return NewProtocolError(ErrorInvalidCapability, "capability version must use the numeric version field")
+	}
 	return nil
+}
+
+func allASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := range value {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateAndSortCapabilityVersions(versions []uint16, limits Limits) ([]uint16, error) {

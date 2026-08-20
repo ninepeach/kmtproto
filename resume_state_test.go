@@ -33,7 +33,7 @@ func (p *blockingStateSnapshotProvider) Snapshot(ctx context.Context, namespaces
 	return p.delegate.Snapshot(ctx, namespaces, limits)
 }
 
-func reconnectStateClient(t *testing.T, client *Client, oldGeneration ConnectionGeneration, namespaces []string) (ConnectionGeneration, Envelope) {
+func reconnectStateClient(t *testing.T, client *ClientProtocol, oldGeneration ConnectionGeneration, namespaces []string) (ConnectionGeneration, Envelope) {
 	t.Helper()
 	if err := client.Disconnect(oldGeneration); err != nil {
 		t.Fatal(err)
@@ -204,12 +204,15 @@ func TestStaleStateDuringResumeFailsConservatively(t *testing.T) {
 		Payload: mustPayload(StateSnapshotPayload{States: []StateObject{{Namespace: "message", ObjectID: "msg001", Version: 5, Data: json.RawMessage(`{}`)}}}),
 	}
 	actions, err := client.HandleIncoming(generation, snapshot)
-	if err != nil || len(actions) != 2 || client.State() != StateDisconnected || client.LastSeq() != 0 {
+	if err != nil || len(actions) != 3 || client.State() != StateDisconnected || client.LastSeq() != 0 {
 		t.Fatalf("stale resume State was not rejected: actions=%d state=%s seq=%d err=%v", len(actions), client.State(), client.LastSeq(), err)
 	}
 	protocolAction, ok := actions[0].(ProtocolErrorAction)
 	if !ok || protocolAction.Error.Code != ErrorStateSyncRequired {
 		t.Fatalf("missing STATE_SYNC_REQUIRED action: %#v", actions)
+	}
+	if _, ok := actions[1].(FullSyncRequiredAction); !ok {
+		t.Fatalf("missing terminal full-sync action: %#v", actions)
 	}
 	if current, found := client.StateObject("message", "msg001"); !found || current.Version != 6 {
 		t.Fatalf("stale resume State overwrote client: %#v found=%v", current, found)
@@ -345,7 +348,7 @@ func TestResumeSnapshotSerializesBeforeConcurrentLiveStateUpdate(t *testing.T) {
 }
 
 type reentrantStateSnapshotProvider struct {
-	server   *Server
+	server   *ServerProtocol
 	delegate StateSnapshotProvider
 	outbound *OutboundQueue
 	result   error

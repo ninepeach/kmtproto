@@ -24,7 +24,7 @@ synchronization.
 No transport, business workflow, authentication policy, authorization policy,
 database, distributed ownership, or multi-node consistency behavior has been
 added to the protocol core. Memory stores, `OutboundQueue`, `SingleWriter`, and
-`ServerConnection` remain process-local reference helpers.
+`ServerAdmission` remain process-local reference helpers.
 
 The implementation does not reproduce every idea in the historical design and
 roadmap. It intentionally retains Frame-specific correlation and
@@ -42,7 +42,7 @@ contains the final rules rather than design discussion.
 | Finding from `review-v0.2-final.md` | Verification | Status |
 |---|---|---|
 | C-01: wire/version ambiguity | `WireVersionV2` is uniquely defined as `2`; all outbound Frames use it; all other versions deterministically produce closing `UNSUPPORTED_VERSION`; the normative specification declares no downgrade mode | **Resolved** |
-| C-02: READY Gap Resume admission | Client enters RESUMING without advancing `last_seq`; `ServerConnection` accepts a same-Session RESUME from READY, fences the recovery state, and returns to READY only on explicit success | **Resolved** |
+| C-02: READY Gap Resume admission | ClientProtocol enters RESUMING without advancing `last_seq`; `ServerAdmission` accepts a same-Session RESUME from READY, fences the recovery state, and returns to READY only on explicit success | **Resolved** |
 | H-01: unbounded server Replay bytes | Server and ReplayStore receive both event and encoded-byte limits; overflow maps to `SYNC_REQUIRED` before a successful Resume batch | **Resolved** |
 | H-02: late State materialization limits | query snapshots use bounded incremental accumulation; namespace snapshot providers receive `StateSnapshotLimits` before materialization; oversized/failing snapshots have deterministic ERROR behavior | **Resolved** |
 | H-03: same-Session callback re-entry deadlock | injected callback execution occurs without the lane mutex held; same-lane entry during a callback fails immediately with `ErrStreamCallbackActive` and is covered for EVENT and State providers | **Resolved** |
@@ -71,7 +71,7 @@ Freeze-blocking findings after verification:
 | Unsupported optional offers are omitted | negotiation lifecycle test | PASS |
 | Unsupported required offers fail before Session creation | required-capability test | PASS |
 | Negotiated capabilities are immutable and reused by Resume | `SessionCapabilities`; defensive-copy and lifecycle tests | PASS |
-| State feature checks use Session capability state | Client, Server, and `ServerConnection` capability gates | PASS |
+| State feature checks use Session capability state | `ClientProtocol`, `ServerProtocol`, and `ServerAdmission` capability gates | PASS |
 
 ### Reliable SEND and ACK
 
@@ -91,7 +91,7 @@ Freeze-blocking findings after verification:
 | Only EVENT consumes Session sequence | Frame validator and `TestOnlyEventChangesLastSequence` | PASS |
 | Sequence starts at 1, is monotonic, and survives pruning | replay store append/high-water tests | PASS |
 | `(session_id, seq)` retains stable event identity | duplicate/conflict and identity-window tests | PASS |
-| Gap detection never advances `last_seq` | Client gap test and READY ServerConnection recovery test | PASS |
+| Gap detection never advances `last_seq` | ClientProtocol gap test and READY ServerAdmission recovery test | PASS |
 | Replay has fixed bounds and preserves original Frames | boundary/identity tests | PASS |
 | Partial Replay is not delivered | buffered Replay and interrupted recovery tests | PASS |
 | Replay event and byte ceilings fail deterministically | Client and Server limit tests | PASS |
@@ -121,16 +121,16 @@ Freeze-blocking findings after verification:
 
 ## 4. Concurrency and lifecycle review
 
-`Client` serializes state mutation with one mutex and returns Actions for later
+`ClientProtocol` serializes state mutation with one mutex and returns Actions for later
 execution; it performs no network I/O and invokes no user callback while the
 mutex is held.
 
-`ServerConnection` validates and snapshots admission state under its mutex,
-then releases it before invoking `Server`. A generation/outbound identity check
+`ServerAdmission` validates and snapshots admission state under its mutex,
+then releases it before invoking `ServerProtocol`. A generation/outbound identity check
 fences the later result, so an old handler cannot mutate a replacement
 connection.
 
-`Server` releases its flight-map mutex before Dedup Store and Application
+`ServerProtocol` releases its flight-map mutex before Dedup Store and Application
 calls. The per-Session stream lane serializes Replay, live EVENT, and live
 State output, but releases its mutex before Session Repository, Replay Store,
 Event Appender, and State Snapshot Provider calls. Callback-active detection

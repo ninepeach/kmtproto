@@ -24,6 +24,27 @@ func stateSyncEnabled(capabilities SessionCapabilities) bool {
 	return enabled && version == CapabilityStateSyncVersion
 }
 
+func validateImplementedCapabilityOffers(offers []CapabilityOffer) error {
+	for _, offer := range offers {
+		if offer.Name == CapabilityStateSync &&
+			(len(offer.Versions) != 1 || offer.Versions[0] != CapabilityStateSyncVersion) {
+			return NewProtocolError(ErrorInvalidCapability, "state-sync must use its implemented numeric version")
+		}
+	}
+	return nil
+}
+
+func validateImplementedCapabilityRegistry(registry *CapabilityRegistry) error {
+	if registry == nil {
+		return nil
+	}
+	versions, configured := registry.versions[CapabilityStateSync]
+	if configured && (len(versions) != 1 || versions[0] != CapabilityStateSyncVersion) {
+		return NewProtocolError(ErrorInvalidCapability, "state-sync must use its implemented numeric version")
+	}
+	return nil
+}
+
 var (
 	ErrStateStale            = errors.New("kmtproto: stale state version")
 	ErrStateConflict         = errors.New("kmtproto: state version conflict")

@@ -54,21 +54,21 @@ func (a *recordingApp) count() int {
 	return len(a.calls)
 }
 
-func newTestServer(t *testing.T, app ApplicationHandler) (*Server, *FakeClock, *MemoryReplayStore) {
+func newTestServer(t *testing.T, app ApplicationHandler) (*ServerProtocol, *FakeClock, *MemoryReplayStore) {
 	t.Helper()
 	clock := NewFakeClock(time.Unix(200, 0))
 	config := DefaultServerConfig()
 	config.Clock = clock
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return server, clock, replay
 }
 
-func createTestSession(t *testing.T, server *Server) {
+func createTestSession(t *testing.T, server *ServerProtocol) {
 	t.Helper()
 	out := NewOutboundQueue()
 	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
@@ -233,9 +233,9 @@ func TestSyncRequiredOutsideReplayWindow(t *testing.T) {
 	}
 }
 
-func TestServerConnectionRejectsOldGeneration(t *testing.T) {
+func TestServerAdmissionRejectsOldGeneration(t *testing.T) {
 	server, _, _ := newTestServer(t, &recordingApp{})
-	connection := NewServerConnection()
+	connection := NewServerAdmission()
 	oldGeneration, _ := connection.Replace()
 	newGeneration, _ := connection.Replace()
 	if newGeneration <= oldGeneration {
@@ -269,7 +269,7 @@ func TestFailureAfterCompleteRecoversByAckReplay(t *testing.T) {
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	config.FailureInjector = failAt(FailAfterComplete)
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,13 +297,13 @@ func TestTTLConfigurationInvariant(t *testing.T) {
 	config.SessionResumeTTL = time.Hour
 	clock := NewFakeClock(time.Unix(0, 0))
 	replay := NewMemoryReplayStore()
-	_, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
+	_, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
 	if err == nil {
 		t.Fatal("expected incompatible TTL rejection")
 	}
 
 	config = DefaultServerConfig()
-	_, err = NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
+	_, err = NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
 	if err == nil {
 		t.Fatal("expected short injected dedup retention rejection")
 	}

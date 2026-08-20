@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-func readyClient(t *testing.T) (*Client, *FakeClock, ConnectionGeneration) {
+func readyClient(t *testing.T) (*ClientProtocol, *FakeClock, ConnectionGeneration) {
 	t.Helper()
 	clock := NewFakeClock(time.Unix(100, 0))
 	config := DefaultClientConfig()
 	config.Clock = clock
-	client, err := NewClient(config)
+	client, err := NewClientProtocol(config)
 	if err != nil {
 		t.Fatal(err)
 	}

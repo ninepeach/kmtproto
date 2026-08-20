@@ -66,7 +66,7 @@ type streamLane struct {
 	running        bool
 	callbackActive bool
 	queue          []streamRequest
-	users          int // guarded by Server.laneMu
+	users          int // guarded by ServerProtocol.laneMu
 }
 
 type sendFlight struct {
@@ -82,10 +82,13 @@ type sendFlight struct {
 // weakening per-session serialization.
 var ErrStreamCallbackActive = errors.New("kmtproto: session stream callback is active")
 
-// Server is a transport-independent frame processor and is safe for concurrent
-// use when its injected stores and application satisfy their concurrency
-// contracts. It performs no transport I/O and owns no connection lifecycle.
-type Server struct {
+// ServerProtocol is a transport-independent server-side protocol frame
+// processor/state machine. It is safe for concurrent use when its injected
+// stores and application satisfy their concurrency contracts. It does not own
+// network connections, open WebSocket/TCP/QUIC connections, perform transport
+// I/O, or manage transport lifecycle; those responsibilities remain with the
+// caller.
+type ServerProtocol struct {
 	config   ServerConfig
 	sessions SessionRepository
 	dedup    ServerSessionStore
@@ -106,7 +109,9 @@ type serverHandleResult struct {
 	abandonSession bool
 }
 
-func NewServer(config ServerConfig, sessions SessionRepository, dedup ServerSessionStore, replay ReplayStore, appender EventAppender, app ApplicationHandler) (*Server, error) {
+// NewServerProtocol creates a server-side protocol frame processor/state
+// machine. It does not create or own a network listener or connection.
+func NewServerProtocol(config ServerConfig, sessions SessionRepository, dedup ServerSessionStore, replay ReplayStore, appender EventAppender, app ApplicationHandler) (*ServerProtocol, error) {
 	if config.Clock == nil {
 		config.Clock = RealClock{}
 	}
@@ -118,6 +123,9 @@ func NewServer(config ServerConfig, sessions SessionRepository, dedup ServerSess
 		config.Capabilities = emptyCapabilityRegistry()
 	}
 	if err := config.Capabilities.validate(config.Limits); err != nil {
+		return nil, fmt.Errorf("kmtproto: invalid server capabilities: %w", err)
+	}
+	if err := validateImplementedCapabilityRegistry(config.Capabilities); err != nil {
 		return nil, fmt.Errorf("kmtproto: invalid server capabilities: %w", err)
 	}
 	if config.MaxReplayEvents == 0 {
@@ -153,15 +161,15 @@ func NewServer(config ServerConfig, sessions SessionRepository, dedup ServerSess
 			return nil, errors.New("kmtproto: dedup store retention must cover ClientRetryTTL and SessionResumeTTL")
 		}
 	}
-	return &Server{config: config, sessions: sessions, dedup: dedup, replay: replay, appender: appender, app: app, flights: make(map[string]*sendFlight), lanes: make(map[string]*streamLane)}, nil
+	return &ServerProtocol{config: config, sessions: sessions, dedup: dedup, replay: replay, appender: appender, app: app, flights: make(map[string]*sendFlight), lanes: make(map[string]*streamLane)}, nil
 }
 
-func (s *Server) HandleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
+func (s *ServerProtocol) HandleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
 	_, err := s.handleIncoming(ctx, frame, outbound)
 	return err
 }
 
-func (s *Server) handleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+func (s *ServerProtocol) handleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
 	if outbound == nil {
 		return serverHandleResult{}, errors.New("kmtproto: nil outbound queue")
 	}
@@ -204,28 +212,30 @@ func (s *Server) handleIncoming(ctx context.Context, frame Envelope, outbound *O
 	}
 }
 
-func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+func (s *ServerProtocol) handleStateQuery(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+	now := s.config.Clock.Now()
+	timestamp := now.UnixMilli()
 	result := serverHandleResult{}
 	err := s.runStream(frame.SessionID, func(lane *streamLane) error {
 		var session SessionState
 		var exists bool
 		if err := lane.invokeCallback(func() error {
 			var lookupErr error
-			session, exists, lookupErr = s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
+			session, exists, lookupErr = s.sessions.Lookup(frame.SessionID, now)
 			return lookupErr
 		}); err != nil {
 			return err
 		}
 		if !exists {
 			result.abandonSession = true
-			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false, timestamp)
 		}
 		if !stateSyncEnabled(session.Capabilities) {
 			result.close = true
-			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorProtocolViolation, "STATE_QUERY requires state-sync capability version 1", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorProtocolViolation, "STATE_QUERY requires state-sync capability version 1", false, timestamp)
 		}
 		if s.config.StateStore == nil {
-			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "State store is unavailable", true)
+			return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInternal, "State store is unavailable", true, timestamp)
 		}
 		var query StateQueryPayload
 		if err := decodePayload(frame.Payload, &query, s.config.StrictValidation); err != nil {
@@ -236,7 +246,7 @@ func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound 
 			Type:      FrameStateSnapshot,
 			ID:        frame.ID,
 			SessionID: frame.SessionID,
-			Timestamp: s.config.Clock.Now().UnixMilli(),
+			Timestamp: timestamp,
 		}
 		snapshotLimits, err := s.stateSnapshotLimits(snapshot)
 		if err != nil {
@@ -269,7 +279,7 @@ func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound 
 			}
 			if err := accumulator.Add(object); err != nil {
 				if errors.Is(err, ErrStateSnapshotLimitExceeded) {
-					return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+					return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false, timestamp)
 				}
 				return err
 			}
@@ -277,7 +287,7 @@ func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound 
 		snapshot.Payload, err = accumulator.Payload()
 		if err != nil {
 			if errors.Is(err, ErrStateSnapshotLimitExceeded) {
-				return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+				return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false, timestamp)
 			}
 			return err
 		}
@@ -286,22 +296,23 @@ func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound 
 	return result, err
 }
 
-func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json.RawMessage, outbound *OutboundQueue) error {
+func (s *ServerProtocol) PublishEvent(sessionID, eventID, eventType string, content json.RawMessage, outbound *OutboundQueue) error {
 	if outbound == nil || sessionID == "" || eventID == "" || !json.Valid(content) || !utf8.ValidString(eventID) {
 		return NewProtocolError(ErrorBadRequest, "invalid event publication")
 	}
 	if len(eventID) > s.config.Limits.MaxIDLength || len(sessionID) > s.config.Limits.MaxSessionIDLength || len(content) > s.config.Limits.MaxPayloadSize {
 		return NewProtocolError(ErrorBadRequest, "event publication exceeds protocol limits")
 	}
+	now := s.config.Clock.Now()
 	contentCopy := append(json.RawMessage(nil), content...)
-	probe := Envelope{V: WireVersionV2, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: ^uint64(0), Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(EventPayload{EventType: eventType, Content: contentCopy})}
+	probe := Envelope{V: WireVersionV2, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: ^uint64(0), Timestamp: now.UnixMilli(), Payload: mustPayload(EventPayload{EventType: eventType, Content: contentCopy})}
 	if err := validateOutboundFrame(&probe, s.config.Limits, s.config.StrictValidation); err != nil {
 		return err
 	}
 	return s.runStream(sessionID, func(lane *streamLane) error {
 		var exists bool
 		err := lane.invokeCallback(func() error {
-			_, found, lookupErr := s.sessions.Lookup(sessionID, s.config.Clock.Now())
+			_, found, lookupErr := s.sessions.Lookup(sessionID, now)
 			exists = found
 			return lookupErr
 		})
@@ -314,7 +325,7 @@ func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json
 		var event Envelope
 		err = lane.invokeCallback(func() error {
 			var appendErr error
-			event, appendErr = s.appender.Append(sessionID, eventID, eventType, append([]byte(nil), contentCopy...), s.config.Clock.Now().UnixMilli())
+			event, appendErr = s.appender.Append(sessionID, eventID, eventType, append([]byte(nil), contentCopy...), now.UnixMilli())
 			return appendErr
 		})
 		if err != nil {
@@ -337,19 +348,20 @@ func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json
 
 // PublishStateUpdate emits one already-committed complete State replacement.
 // It neither writes StateStore nor participates in the EVENT stream or replay.
-func (s *Server) PublishStateUpdate(sessionID, updateID string, object StateObject, outbound *OutboundQueue) error {
+func (s *ServerProtocol) PublishStateUpdate(sessionID, updateID string, object StateObject, outbound *OutboundQueue) error {
 	if outbound == nil {
 		return errors.New("kmtproto: nil outbound queue")
 	}
 	if err := ValidateStateObject(&object, s.config.Limits); err != nil {
 		return err
 	}
+	now := s.config.Clock.Now()
 	return s.runStream(sessionID, func(lane *streamLane) error {
 		var session SessionState
 		var exists bool
 		err := lane.invokeCallback(func() error {
 			var lookupErr error
-			session, exists, lookupErr = s.sessions.Lookup(sessionID, s.config.Clock.Now())
+			session, exists, lookupErr = s.sessions.Lookup(sessionID, now)
 			return lookupErr
 		})
 		if err != nil {
@@ -366,14 +378,14 @@ func (s *Server) PublishStateUpdate(sessionID, updateID string, object StateObje
 			Type:      FrameStateUpdate,
 			ID:        updateID,
 			SessionID: sessionID,
-			Timestamp: s.config.Clock.Now().UnixMilli(),
+			Timestamp: now.UnixMilli(),
 			Payload:   mustPayload(StateUpdatePayload{State: cloneStateObject(object)}),
 		}
 		return s.enqueueFrame(outbound, frame)
 	})
 }
 
-func (s *Server) handleHello(frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+func (s *ServerProtocol) handleHello(frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
 	var hello HelloPayload
 	if err := decodePayload(frame.Payload, &hello, s.config.StrictValidation); err != nil {
 		return serverHandleResult{}, err
@@ -411,7 +423,7 @@ func (s *Server) handleHello(frame Envelope, outbound *OutboundQueue) (serverHan
 	return serverHandleResult{readySessionID: sessionID, capabilities: accepted}, nil
 }
 
-func (s *Server) handlePing(frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
+func (s *ServerProtocol) handlePing(frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
 	_, exists, err := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
 	if err != nil {
 		return err
@@ -428,7 +440,9 @@ func (s *Server) handlePing(frame Envelope, outbound *OutboundQueue, result *ser
 	return s.enqueueFrame(outbound, pong)
 }
 
-func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
+func (s *ServerProtocol) handleSend(ctx context.Context, frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
+	now := s.config.Clock.Now()
+	timestamp := now.UnixMilli()
 	var payload SendPayload
 	if err := decodePayload(frame.Payload, &payload, s.config.StrictValidation); err != nil {
 		return err
@@ -438,7 +452,7 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 	key := dedupKey(frame.SessionID, frame.ID)
 	flight, leader, conflict, callbackActive := s.acquireFlight(key, fingerprint)
 	if conflict {
-		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false)
+		return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false, timestamp)
 	}
 	if !leader {
 		if callbackActive {
@@ -448,15 +462,15 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 				}
 				return s.enqueueFrame(outbound, *ack)
 			}
-			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND callback is active; retry with the same id", true)
+			return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND callback is active; retry with the same id", true, timestamp)
 		}
-		return s.waitForOriginal(ctx, flight, frame, outbound)
+		return s.waitForOriginal(ctx, flight, frame, outbound, timestamp)
 	}
 	defer s.finishFlight(key, flight)
 
 	var exists bool
 	if err := s.invokeSendCallback(key, flight, func() error {
-		_, found, lookupErr := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
+		_, found, lookupErr := s.sessions.Lookup(frame.SessionID, now)
 		exists = found
 		return lookupErr
 	}); err != nil {
@@ -464,7 +478,7 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 	}
 	if !exists {
 		result.abandonSession = true
-		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false)
+		return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false, timestamp)
 	}
 
 	var claimed bool
@@ -478,7 +492,7 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 	}
 	if !claimed {
 		if existing != nil && existing.Fingerprint != fingerprint {
-			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false, timestamp)
 		}
 		if existing != nil && existing.State == DedupCompleted && existing.Ack != nil {
 			if err := s.validateStoredACK(*existing.Ack, frame.SessionID, frame.ID); err != nil {
@@ -487,7 +501,7 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 			s.setFlightACK(flight, *existing.Ack)
 			return s.enqueueFrame(outbound, *existing.Ack)
 		}
-		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND is still processing; retry with the same id", true)
+		return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND is still processing; retry with the same id", true, timestamp)
 	}
 
 	if err := s.invokeSendCallback(key, flight, func() error { return s.inject(FailAfterClaim) }); err != nil {
@@ -498,12 +512,12 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 	}); err != nil {
 		// Application failure may be an indeterminate commit. Leave the Claim in
 		// PROCESSING so elapsed time or an ordinary retry cannot execute it again.
-		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "application rejected SEND", true)
+		return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInternal, "application rejected SEND", true, timestamp)
 	}
 	if err := s.invokeSendCallback(key, flight, func() error { return s.inject(FailAfterApplication) }); err != nil {
 		return err
 	}
-	ack := Envelope{V: WireVersionV2, Type: FrameAck, SessionID: frame.SessionID, Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(AckPayload{RefID: frame.ID})}
+	ack := Envelope{V: WireVersionV2, Type: FrameAck, SessionID: frame.SessionID, Timestamp: timestamp, Payload: mustPayload(AckPayload{RefID: frame.ID})}
 	if err := validateOutboundFrame(&ack, s.config.Limits, s.config.StrictValidation); err != nil {
 		return err
 	}
@@ -519,7 +533,7 @@ func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *Outbo
 	return s.enqueueFrame(outbound, ack)
 }
 
-func (s *Server) waitForOriginal(ctx context.Context, flight *sendFlight, frame Envelope, outbound *OutboundQueue) error {
+func (s *ServerProtocol) waitForOriginal(ctx context.Context, flight *sendFlight, frame Envelope, outbound *OutboundQueue, timestamp int64) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -532,27 +546,34 @@ func (s *Server) waitForOriginal(ctx context.Context, flight *sendFlight, frame 
 		}
 		return s.enqueueFrame(outbound, *ack)
 	}
-	return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "original SEND did not complete; retry", true)
+	return s.enqueueErrorAt(outbound, frame.SessionID, frame.ID, ErrorInternal, "original SEND did not complete; retry", true, timestamp)
 }
 
-func (s *Server) handleResume(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+func (s *ServerProtocol) handleResume(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
+	now := s.config.Clock.Now()
+	timestamp := now.UnixMilli()
 	var resume ResumePayload
 	if err := decodePayload(frame.Payload, &resume, s.config.StrictValidation); err != nil {
 		return serverHandleResult{}, err
 	}
-	state, exists, err := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
+	state, exists, err := s.sessions.Lookup(frame.SessionID, now)
 	if err != nil {
 		return serverHandleResult{}, err
 	}
 	if !exists {
-		return serverHandleResult{abandonSession: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorInvalidSession, "session expired or unknown", false)
+		return serverHandleResult{abandonSession: true}, s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInvalidSession, "session expired or unknown", false, timestamp)
 	}
+	stateSnapshotID := ""
 	if resume.StateSync != nil {
 		if !stateSyncEnabled(state.Capabilities) {
-			return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorUnsupportedFeature, "RESUME requires state-sync capability version 1", false)
+			return serverHandleResult{close: true}, s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorUnsupportedFeature, "RESUME requires state-sync capability version 1", false, timestamp)
 		}
 		if s.config.StateSnapshots == nil {
-			return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot provider is unavailable", true)
+			return serverHandleResult{close: true}, s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot provider is unavailable", true, timestamp)
+		}
+		stateSnapshotID, err = s.config.NewFrameID()
+		if err != nil || stateSnapshotID == "" {
+			return serverHandleResult{close: true}, s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot identity could not be produced", true, timestamp)
 		}
 	}
 	result := serverHandleResult{capabilities: state.Capabilities}
@@ -564,17 +585,18 @@ func (s *Server) handleResume(ctx context.Context, frame Envelope, outbound *Out
 			return currentErr
 		})
 		if err != nil {
-			return err
+			result.close = true
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInternal, "replay high-water could not be read", true, timestamp)
 		}
 		if resume.LastSeq > replayTo {
 			result.close = true
-			return s.enqueueError(outbound, frame.SessionID, "", ErrorProtocolViolation, "last_seq is ahead of server stream", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorProtocolViolation, "last_seq is ahead of server stream", false, timestamp)
 		}
 		if resume.LastSeq == math.MaxUint64 {
-			return s.enqueueError(outbound, frame.SessionID, "", ErrorSyncRequired, "event sequence is exhausted", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorSyncRequired, "event sequence is exhausted", false, timestamp)
 		}
 		if replayTo-resume.LastSeq > s.config.MaxReplayEvents {
-			return s.enqueueError(outbound, frame.SessionID, "", ErrorSyncRequired, "replay exceeds configured event limit", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorSyncRequired, "replay exceeds configured event limit", false, timestamp)
 		}
 		var events []Envelope
 		err = lane.invokeCallback(func() error {
@@ -586,37 +608,41 @@ func (s *Server) handleResume(ctx context.Context, frame Envelope, outbound *Out
 			return replayErr
 		})
 		if errors.Is(err, ErrReplayLimitExceeded) {
-			return s.enqueueError(outbound, frame.SessionID, "", ErrorSyncRequired, "replay exceeds configured byte limit", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorSyncRequired, "replay exceeds configured byte limit", false, timestamp)
 		}
 		if errors.Is(err, ErrReplayUnavailable) {
-			return s.enqueueError(outbound, frame.SessionID, "", ErrorSyncRequired, "replay window no longer covers last_seq", false)
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorSyncRequired, "replay window no longer covers last_seq", false, timestamp)
 		}
 		if err != nil {
-			return err
+			result.close = true
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInternal, "replay could not be produced", true, timestamp)
 		}
 		expectedSeq := resume.LastSeq + 1
 		for i := range events {
 			if err := validateOutboundFrame(&events[i], s.config.Limits, s.config.StrictValidation); err != nil {
-				return fmt.Errorf("kmtproto: invalid replay event: %w", err)
+				result.close = true
+				return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInternal, "replay store returned an invalid EVENT", true, timestamp)
 			}
 			if events[i].Type != FrameEvent || events[i].SessionID != frame.SessionID || events[i].Seq != expectedSeq {
-				return errors.New("kmtproto: replay store returned a non-contiguous event range")
+				result.close = true
+				return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInternal, "replay store returned a non-contiguous event range", true, timestamp)
 			}
 			expectedSeq++
 		}
 		if expectedSeq != replayTo+1 {
-			return errors.New("kmtproto: replay store returned an incomplete event range")
+			result.close = true
+			return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorInternal, "replay store returned an incomplete event range", true, timestamp)
 		}
 		var stateSnapshot *Envelope
 		if resume.StateSync != nil {
-			snapshot, err := s.buildResumeStateSnapshot(ctx, lane, frame.SessionID, resume.StateSync.Namespaces)
+			snapshot, err := s.buildResumeStateSnapshot(ctx, lane, frame.SessionID, stateSnapshotID, timestamp, resume.StateSync.Namespaces)
 			if err != nil {
 				result.close = true
-				return s.enqueueError(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot could not be produced", true)
+				return s.enqueueErrorAt(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot could not be produced", true, timestamp)
 			}
 			stateSnapshot = &snapshot
 		}
-		welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: frame.SessionID, Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ServerTime: s.config.Clock.Now().UnixMilli(), ResumeFrom: resume.LastSeq + 1, ReplayTo: replayTo, StateSync: cloneResumeStateSync(resume.StateSync)})}
+		welcome := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: frame.SessionID, Timestamp: timestamp, Payload: mustPayload(WelcomePayload{Mode: WelcomeModeResumed, ServerTime: timestamp, ResumeFrom: resume.LastSeq + 1, ReplayTo: replayTo, StateSync: cloneResumeStateSync(resume.StateSync)})}
 		if err := validateOutboundFrame(&welcome, s.config.Limits, s.config.StrictValidation); err != nil {
 			return err
 		}
@@ -635,17 +661,13 @@ func (s *Server) handleResume(ctx context.Context, frame Envelope, outbound *Out
 	return result, err
 }
 
-func (s *Server) buildResumeStateSnapshot(ctx context.Context, lane *streamLane, sessionID string, namespaces []string) (Envelope, error) {
-	frameID, err := s.config.NewFrameID()
-	if err != nil {
-		return Envelope{}, err
-	}
+func (s *ServerProtocol) buildResumeStateSnapshot(ctx context.Context, lane *streamLane, sessionID, frameID string, timestamp int64, namespaces []string) (Envelope, error) {
 	snapshot := Envelope{
 		V:         WireVersionV2,
 		Type:      FrameStateSnapshot,
 		ID:        frameID,
 		SessionID: sessionID,
-		Timestamp: s.config.Clock.Now().UnixMilli(),
+		Timestamp: timestamp,
 	}
 	snapshotLimits, err := s.stateSnapshotLimits(snapshot)
 	if err != nil {
@@ -708,7 +730,7 @@ func (s *Server) buildResumeStateSnapshot(ctx context.Context, lane *streamLane,
 	return snapshot, nil
 }
 
-func (s *Server) stateSnapshotLimits(frame Envelope) (StateSnapshotLimits, error) {
+func (s *ServerProtocol) stateSnapshotLimits(frame Envelope) (StateSnapshotLimits, error) {
 	probe := copyEnvelope(frame)
 	probe.Payload = json.RawMessage(`{}`)
 	encoded, err := json.Marshal(probe)
@@ -724,7 +746,11 @@ func (s *Server) stateSnapshotLimits(frame Envelope) (StateSnapshotLimits, error
 	return StateSnapshotLimits{MaxObjects: s.config.Limits.MaxStateSnapshotObjects, MaxBytes: maxBytes}, nil
 }
 
-func (s *Server) errorFrame(sessionID, refID, code, message string, retryable bool) Envelope {
+func (s *ServerProtocol) errorFrame(sessionID, refID, code, message string, retryable bool) Envelope {
+	return s.errorFrameAt(sessionID, refID, code, message, retryable, s.config.Clock.Now().UnixMilli())
+}
+
+func (s *ServerProtocol) errorFrameAt(sessionID, refID, code, message string, retryable bool, timestamp int64) Envelope {
 	if len(sessionID) > s.config.Limits.MaxSessionIDLength || !utf8.ValidString(sessionID) {
 		sessionID = ""
 	}
@@ -732,7 +758,7 @@ func (s *Server) errorFrame(sessionID, refID, code, message string, retryable bo
 		refID = ""
 	}
 	message = truncateUTF8(message, s.config.Limits.MaxErrorMessageLength)
-	return Envelope{V: WireVersionV2, Type: FrameError, SessionID: sessionID, Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(ErrorPayload{Code: code, Message: message, RefID: refID, Retryable: retryable})}
+	return Envelope{V: WireVersionV2, Type: FrameError, SessionID: sessionID, Timestamp: timestamp, Payload: mustPayload(ErrorPayload{Code: code, Message: message, RefID: refID, Retryable: retryable})}
 }
 
 func truncateUTF8(value string, limit int) string {
@@ -749,8 +775,12 @@ func truncateUTF8(value string, limit int) string {
 	return value[:cut]
 }
 
-func (s *Server) enqueueError(outbound *OutboundQueue, sessionID, refID, code, message string, retryable bool) error {
-	if err := s.enqueueFrame(outbound, s.errorFrame(sessionID, refID, code, message, retryable)); err != nil {
+func (s *ServerProtocol) enqueueError(outbound *OutboundQueue, sessionID, refID, code, message string, retryable bool) error {
+	return s.enqueueErrorAt(outbound, sessionID, refID, code, message, retryable, s.config.Clock.Now().UnixMilli())
+}
+
+func (s *ServerProtocol) enqueueErrorAt(outbound *OutboundQueue, sessionID, refID, code, message string, retryable bool, timestamp int64) error {
+	if err := s.enqueueFrame(outbound, s.errorFrameAt(sessionID, refID, code, message, retryable, timestamp)); err != nil {
 		return err
 	}
 	if behavior, ok := BehaviorForErrorCode(code); ok && behavior.CloseConnection {
@@ -759,14 +789,14 @@ func (s *Server) enqueueError(outbound *OutboundQueue, sessionID, refID, code, m
 	return nil
 }
 
-func (s *Server) enqueueFrame(outbound *OutboundQueue, frame Envelope) error {
+func (s *ServerProtocol) enqueueFrame(outbound *OutboundQueue, frame Envelope) error {
 	if err := validateOutboundFrame(&frame, s.config.Limits, s.config.StrictValidation); err != nil {
 		return err
 	}
 	return outbound.Enqueue(frame)
 }
 
-func (s *Server) validateStoredACK(ack Envelope, sessionID, messageID string) error {
+func (s *ServerProtocol) validateStoredACK(ack Envelope, sessionID, messageID string) error {
 	if err := validateOutboundFrame(&ack, s.config.Limits, s.config.StrictValidation); err != nil {
 		return fmt.Errorf("kmtproto: dedup store returned invalid ACK: %w", err)
 	}
@@ -783,14 +813,14 @@ func (s *Server) validateStoredACK(ack Envelope, sessionID, messageID string) er
 	return nil
 }
 
-func (s *Server) inject(point string) error {
+func (s *ServerProtocol) inject(point string) error {
 	if s.config.FailureInjector == nil {
 		return nil
 	}
 	return s.config.FailureInjector.Fail(point)
 }
 
-func (s *Server) acquireFlight(key string, fingerprint SendFingerprint) (flight *sendFlight, leader, conflict, callbackActive bool) {
+func (s *ServerProtocol) acquireFlight(key string, fingerprint SendFingerprint) (flight *sendFlight, leader, conflict, callbackActive bool) {
 	s.flightMu.Lock()
 	defer s.flightMu.Unlock()
 	if existing := s.flights[key]; existing != nil {
@@ -801,7 +831,7 @@ func (s *Server) acquireFlight(key string, fingerprint SendFingerprint) (flight 
 	return flight, true, false, false
 }
 
-func (s *Server) finishFlight(key string, flight *sendFlight) {
+func (s *ServerProtocol) finishFlight(key string, flight *sendFlight) {
 	s.flightMu.Lock()
 	if s.flights[key] == flight {
 		delete(s.flights, key)
@@ -810,7 +840,7 @@ func (s *Server) finishFlight(key string, flight *sendFlight) {
 	s.flightMu.Unlock()
 }
 
-func (s *Server) invokeSendCallback(key string, flight *sendFlight, fn func() error) (err error) {
+func (s *ServerProtocol) invokeSendCallback(key string, flight *sendFlight, fn func() error) (err error) {
 	s.flightMu.Lock()
 	if s.flights[key] != flight || flight.callbackActive {
 		s.flightMu.Unlock()
@@ -822,18 +852,21 @@ func (s *Server) invokeSendCallback(key string, flight *sendFlight, fn func() er
 		s.flightMu.Lock()
 		flight.callbackActive = false
 		s.flightMu.Unlock()
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("kmtproto: SEND dependency callback panicked: %v", recovered)
+		}
 	}()
 	return fn()
 }
 
-func (s *Server) setFlightACK(flight *sendFlight, ack Envelope) {
+func (s *ServerProtocol) setFlightACK(flight *sendFlight, ack Envelope) {
 	s.flightMu.Lock()
 	copyACK := copyEnvelope(ack)
 	flight.ack = &copyACK
 	s.flightMu.Unlock()
 }
 
-func (s *Server) flightACK(flight *sendFlight) *Envelope {
+func (s *ServerProtocol) flightACK(flight *sendFlight) *Envelope {
 	s.flightMu.Lock()
 	defer s.flightMu.Unlock()
 	if flight.ack == nil {
@@ -843,7 +876,7 @@ func (s *Server) flightACK(flight *sendFlight) *Envelope {
 	return &ack
 }
 
-func (s *Server) runStream(sessionID string, fn func(*streamLane) error) error {
+func (s *ServerProtocol) runStream(sessionID string, fn func(*streamLane) error) error {
 	s.laneMu.Lock()
 	lane := s.lanes[sessionID]
 	if lane == nil {
@@ -852,14 +885,15 @@ func (s *Server) runStream(sessionID string, fn func(*streamLane) error) error {
 	}
 	lane.users++
 	s.laneMu.Unlock()
-	err := lane.run(func() error { return fn(lane) })
-	s.laneMu.Lock()
-	lane.users--
-	if lane.users == 0 && s.lanes[sessionID] == lane {
-		delete(s.lanes, sessionID)
-	}
-	s.laneMu.Unlock()
-	return err
+	defer func() {
+		s.laneMu.Lock()
+		lane.users--
+		if lane.users == 0 && s.lanes[sessionID] == lane {
+			delete(s.lanes, sessionID)
+		}
+		s.laneMu.Unlock()
+	}()
+	return lane.run(func() error { return fn(lane) })
 }
 
 func (l *streamLane) run(fn func() error) error {
@@ -920,49 +954,51 @@ func invokeStreamRequest(fn func() error) (err error) {
 	return fn()
 }
 
-// ServerConnection is a concurrency-safe reference admission gate with
-// generation fencing. It does not own transport lifecycle or I/O.
-type ServerConnection struct {
+// ServerAdmission is a concurrency-safe reference protocol admission gate with
+// generation fencing. It tracks handshake/admission state for a caller-owned
+// transport connection generation, but does not represent or own a network
+// connection and performs no transport I/O.
+type ServerAdmission struct {
 	mu           sync.Mutex
 	generation   ConnectionGeneration
 	outbound     *OutboundQueue
-	state        ServerConnectionState
+	state        ServerAdmissionState
 	sessionID    string
 	capabilities SessionCapabilities
 	handshake    bool
 }
 
-// ServerConnectionState is the state of the reference server-side connection
-// gate. Transport ownership remains with the caller.
-type ServerConnectionState uint8
+// ServerAdmissionState is the state of the reference server-side protocol
+// admission gate. Transport ownership and lifecycle remain with the caller.
+type ServerAdmissionState uint8
 
 const (
-	ServerConnectionClosed ServerConnectionState = iota
-	ServerConnectionAwaitingHandshake
-	ServerConnectionReady
-	ServerConnectionResuming
+	ServerAdmissionClosed ServerAdmissionState = iota
+	ServerAdmissionAwaitingHandshake
+	ServerAdmissionReady
+	ServerAdmissionResuming
 )
 
-func (s ServerConnectionState) String() string {
+func (s ServerAdmissionState) String() string {
 	switch s {
-	case ServerConnectionClosed:
+	case ServerAdmissionClosed:
 		return "CLOSED"
-	case ServerConnectionAwaitingHandshake:
+	case ServerAdmissionAwaitingHandshake:
 		return "AWAITING_HANDSHAKE"
-	case ServerConnectionReady:
+	case ServerAdmissionReady:
 		return "READY"
-	case ServerConnectionResuming:
+	case ServerAdmissionResuming:
 		return "RESUMING"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-// NewServerConnection creates a concurrency-safe reference admission gate. It
-// does not own a transport, reader, writer, or connection registry.
-func NewServerConnection() *ServerConnection { return &ServerConnection{} }
+// NewServerAdmission creates a concurrency-safe reference protocol admission
+// gate. It does not own a transport, reader, writer, or connection registry.
+func NewServerAdmission() *ServerAdmission { return &ServerAdmission{} }
 
-func (c *ServerConnection) Replace() (ConnectionGeneration, *OutboundQueue) {
+func (c *ServerAdmission) Replace() (ConnectionGeneration, *OutboundQueue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.outbound != nil {
@@ -970,26 +1006,26 @@ func (c *ServerConnection) Replace() (ConnectionGeneration, *OutboundQueue) {
 	}
 	c.generation++
 	c.outbound = NewOutboundQueue()
-	c.state = ServerConnectionAwaitingHandshake
+	c.state = ServerAdmissionAwaitingHandshake
 	c.sessionID = ""
 	c.capabilities = SessionCapabilities{}
 	c.handshake = false
 	return c.generation, c.outbound
 }
 
-func (c *ServerConnection) State() ServerConnectionState {
+func (c *ServerAdmission) State() ServerAdmissionState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.state
 }
 
-func (c *ServerConnection) Generation() ConnectionGeneration {
+func (c *ServerAdmission) Generation() ConnectionGeneration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.generation
 }
 
-func (c *ServerConnection) SessionID() string {
+func (c *ServerAdmission) SessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID
@@ -997,7 +1033,7 @@ func (c *ServerConnection) SessionID() string {
 
 // Capabilities returns a defensive copy of the capabilities negotiated for
 // the admitted logical Session on this connection generation.
-func (c *ServerConnection) Capabilities() []NegotiatedCapability {
+func (c *ServerAdmission) Capabilities() []NegotiatedCapability {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.List()
@@ -1005,7 +1041,7 @@ func (c *ServerConnection) Capabilities() []NegotiatedCapability {
 
 // CapabilityEnabled reports whether the admitted Session negotiated the named
 // capability on this connection. It returns false before admission.
-func (c *ServerConnection) CapabilityEnabled(name string) bool {
+func (c *ServerAdmission) CapabilityEnabled(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.Enabled(name)
@@ -1013,13 +1049,13 @@ func (c *ServerConnection) CapabilityEnabled(name string) bool {
 
 // CapabilityVersion returns the capability version enabled for the admitted
 // Session on this connection.
-func (c *ServerConnection) CapabilityVersion(name string) (version uint16, ok bool) {
+func (c *ServerAdmission) CapabilityVersion(name string) (version uint16, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.Version(name)
 }
 
-func (c *ServerConnection) Handle(ctx context.Context, server *Server, generation ConnectionGeneration, frame Envelope) error {
+func (c *ServerAdmission) Handle(ctx context.Context, server *ServerProtocol, generation ConnectionGeneration, frame Envelope) error {
 	if server == nil {
 		return errors.New("kmtproto: nil server")
 	}
@@ -1031,71 +1067,82 @@ func (c *ServerConnection) Handle(ctx context.Context, server *Server, generatio
 	outbound := c.outbound
 	state := c.state
 	sessionID := c.sessionID
-	if state == ServerConnectionClosed {
+	if state == ServerAdmissionClosed {
 		c.mu.Unlock()
 		return ErrInvalidState
 	}
 	if err := ValidateFrame(&frame, server.config.Limits, server.config.StrictValidation); err != nil {
 		c.mu.Unlock()
-		result, handleErr := server.handleIncoming(ctx, frame, outbound)
+		result, handleErr := invokeServerHandle(ctx, server, frame, outbound)
 		c.applyResult(generation, outbound, result)
 		return handleErr
 	}
 	allowed := frame.Type == FrameError ||
-		(state == ServerConnectionAwaitingHandshake && (frame.Type == FrameHello || frame.Type == FrameResume)) ||
-		(state == ServerConnectionReady && (frame.Type == FramePing || frame.Type == FrameSend || frame.Type == FrameStateQuery || frame.Type == FrameResume))
-	if !allowed || (state == ServerConnectionReady && frame.SessionID != sessionID) ||
-		(state == ServerConnectionAwaitingHandshake && c.handshake) {
-		c.state = ServerConnectionClosed
+		(state == ServerAdmissionAwaitingHandshake && (frame.Type == FrameHello || frame.Type == FrameResume)) ||
+		(state == ServerAdmissionReady && (frame.Type == FramePing || frame.Type == FrameSend || frame.Type == FrameStateQuery || frame.Type == FrameResume))
+	if !allowed || (state == ServerAdmissionReady && frame.SessionID != sessionID) ||
+		(state == ServerAdmissionAwaitingHandshake && c.handshake) {
+		c.state = ServerAdmissionClosed
 		c.capabilities = SessionCapabilities{}
 		c.handshake = false
 		c.mu.Unlock()
 		return server.enqueueError(outbound, frame.SessionID, frame.ID, ErrorProtocolViolation, "frame is invalid for server connection state", false)
 	}
-	if state == ServerConnectionAwaitingHandshake && frame.Type != FrameError {
+	if state == ServerAdmissionAwaitingHandshake && frame.Type != FrameError {
 		c.handshake = true
 	}
-	if state == ServerConnectionReady && frame.Type == FrameResume {
-		c.state = ServerConnectionResuming
+	if state == ServerAdmissionReady && frame.Type == FrameResume {
+		c.state = ServerAdmissionResuming
 	}
 	c.mu.Unlock()
 
-	result, err := server.handleIncoming(ctx, frame, outbound)
+	result, err := invokeServerHandle(ctx, server, frame, outbound)
 	c.applyResult(generation, outbound, result)
 	return err
 }
 
-func (c *ServerConnection) applyResult(generation ConnectionGeneration, outbound *OutboundQueue, result serverHandleResult) {
+func invokeServerHandle(ctx context.Context, server *ServerProtocol, frame Envelope, outbound *OutboundQueue) (result serverHandleResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			outbound.Close()
+			result = serverHandleResult{close: true}
+			err = fmt.Errorf("kmtproto: server dependency panicked: %v", recovered)
+		}
+	}()
+	return server.handleIncoming(ctx, frame, outbound)
+}
+
+func (c *ServerAdmission) applyResult(generation ConnectionGeneration, outbound *OutboundQueue, result serverHandleResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation || outbound != c.outbound {
 		return
 	}
 	c.handshake = false
-	if c.state == ServerConnectionClosed {
+	if c.state == ServerAdmissionClosed {
 		return
 	}
 	if result.close {
-		c.state = ServerConnectionClosed
+		c.state = ServerAdmissionClosed
 		c.capabilities = SessionCapabilities{}
 		return
 	}
 	if result.abandonSession {
-		c.state = ServerConnectionAwaitingHandshake
+		c.state = ServerAdmissionAwaitingHandshake
 		c.sessionID = ""
 		c.capabilities = SessionCapabilities{}
 		return
 	}
 	if result.readySessionID != "" {
-		c.state = ServerConnectionReady
+		c.state = ServerAdmissionReady
 		c.sessionID = result.readySessionID
 		c.capabilities = result.capabilities
 		return
 	}
-	if c.state == ServerConnectionResuming {
-		// Resume is successful only when the Server returns an explicit
+	if c.state == ServerAdmissionResuming {
+		// Resume is successful only when ServerProtocol returns an explicit
 		// readySessionID. Any other result leaves the connection unusable.
-		c.state = ServerConnectionClosed
+		c.state = ServerAdmissionClosed
 		c.capabilities = SessionCapabilities{}
 	}
 }

@@ -10,39 +10,13 @@ import (
 	"time"
 )
 
-func TestStateFramesRequireExactCapabilityVersion(t *testing.T) {
+func TestStateSyncCapabilityConfigRequiresImplementedNumericVersion(t *testing.T) {
 	clock := NewFakeClock(time.Unix(2_000, 0))
 	clientConfig := DefaultClientConfig()
 	clientConfig.Clock = clock
 	clientConfig.Capabilities = []CapabilityOffer{{Name: CapabilityStateSync, Versions: []uint16{2}, Required: true}}
-	client, err := NewClient(clientConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	generation := client.BeginConnect()
-	if err := client.TransportConnected(generation); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.StartSession(generation, "version-client"); err != nil {
-		t.Fatal(err)
-	}
-	welcome := Envelope{
-		V:         WireVersionV2,
-		Type:      FrameWelcome,
-		SessionID: "s_v2_cap",
-		Payload: mustPayload(WelcomePayload{
-			Mode:                 WelcomeModeNew,
-			AcceptedCapabilities: []NegotiatedCapability{{Name: CapabilityStateSync, Version: 2}},
-		}),
-	}
-	if _, err := client.HandleIncoming(generation, welcome); err != nil {
-		t.Fatal(err)
-	}
-	if version, ok := client.CapabilityVersion(CapabilityStateSync); !ok || version != 2 {
-		t.Fatalf("negotiated version = %d, %v", version, ok)
-	}
-	if _, err := client.QueryState("q", "message", []string{"m"}); protocolErrorCode(err) != ErrorProtocolViolation {
-		t.Fatalf("v1 STATE_QUERY under state-sync@2 returned %v", err)
+	if _, err := NewClientProtocol(clientConfig); protocolErrorCode(err) != ErrorInvalidCapability {
+		t.Fatalf("client accepted unimplemented state-sync version: %v", err)
 	}
 
 	registry, err := NewCapabilityRegistry([]CapabilitySpec{{Name: CapabilityStateSync, Versions: []uint16{2}}}, DefaultLimits())
@@ -55,22 +29,9 @@ func TestStateFramesRequireExactCapabilityVersion(t *testing.T) {
 	serverConfig.StateStore = &testStateStore{objects: make(map[StateIdentity]StateObject)}
 	serverConfig.NewSessionID = func() (string, error) { return "s_v2_cap", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(serverConfig, NewMemorySessionRepository(), NewMemoryDedupStore(clock, serverConfig.DedupTTL), replay, replay, &recordingApp{})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := NewServerProtocol(serverConfig, NewMemorySessionRepository(), NewMemoryDedupStore(clock, serverConfig.DedupTTL), replay, replay, &recordingApp{}); protocolErrorCode(err) != ErrorInvalidCapability {
+		t.Fatalf("server accepted unimplemented state-sync version: %v", err)
 	}
-	helloOut := NewOutboundQueue()
-	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{Capabilities: clientConfig.Capabilities})}
-	if err := server.HandleIncoming(context.Background(), hello, helloOut); err != nil {
-		t.Fatal(err)
-	}
-	_ = nextTestFrame(t, helloOut)
-	queryOut := NewOutboundQueue()
-	query := Envelope{V: WireVersionV2, Type: FrameStateQuery, ID: "q", SessionID: "s_v2_cap", Payload: mustPayload(StateQueryPayload{Namespace: "message", ObjectIDs: []string{"m"}})}
-	if err := server.HandleIncoming(context.Background(), query, queryOut); err != nil {
-		t.Fatal(err)
-	}
-	assertErrorFrameCode(t, nextTestFrame(t, queryOut), ErrorProtocolViolation)
 }
 
 func TestInvalidSessionAlwaysAbandonsClientSession(t *testing.T) {
@@ -92,15 +53,15 @@ func TestInvalidSessionAlwaysAbandonsClientSession(t *testing.T) {
 		t.Fatalf("Session was not abandoned: state=%s session=%q seq=%d", client.State(), client.SessionID(), client.LastSeq())
 	}
 	if len(client.outbox) != 0 || len(client.eventIDs) != 0 || len(client.stateObjects) != 0 {
-		t.Fatal("Session-scoped Client data survived INVALID_SESSION")
+		t.Fatal("Session-scoped ClientProtocol data survived INVALID_SESSION")
 	}
 }
 
-func TestInvalidSessionAbandonsServerConnection(t *testing.T) {
+func TestInvalidSessionAbandonsServerAdmission(t *testing.T) {
 	for _, frameType := range []FrameType{FramePing, FrameSend} {
 		t.Run(string(frameType), func(t *testing.T) {
 			server, clock, _ := newTestServer(t, &recordingApp{})
-			connection := NewServerConnection()
+			connection := NewServerAdmission()
 			generation, outbound := connection.Replace()
 			hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 			if err := connection.Handle(context.Background(), server, generation, hello); err != nil {
@@ -119,7 +80,7 @@ func TestInvalidSessionAbandonsServerConnection(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertErrorFrameCode(t, nextTestFrame(t, outbound), ErrorInvalidSession)
-			if connection.State() != ServerConnectionAwaitingHandshake || connection.SessionID() != "" {
+			if connection.State() != ServerAdmissionAwaitingHandshake || connection.SessionID() != "" {
 				t.Fatalf("server connection retained invalid Session: state=%s session=%q", connection.State(), connection.SessionID())
 			}
 		})
@@ -164,7 +125,7 @@ func TestGapRecoveryIgnoresPreWelcomeInflightEvents(t *testing.T) {
 
 type reentrantSendApp struct {
 	mu       sync.Mutex
-	server   *Server
+	server   *ServerProtocol
 	frame    Envelope
 	outbound *OutboundQueue
 	err      error
@@ -212,7 +173,7 @@ func TestSameSendApplicationReentryFailsFast(t *testing.T) {
 type reentrantClaimStore struct {
 	delegate *MemoryDedupStore
 	once     sync.Once
-	server   *Server
+	server   *ServerProtocol
 	frame    Envelope
 	outbound *OutboundQueue
 	err      error
@@ -243,7 +204,7 @@ func TestSameSendStoreReentryFailsFast(t *testing.T) {
 	replay := NewMemoryReplayStore()
 	store := &reentrantClaimStore{delegate: NewMemoryDedupStore(clock, config.DedupTTL), outbound: NewOutboundQueue()}
 	app := &recordingApp{}
-	server, err := NewServer(config, NewMemorySessionRepository(), store, replay, replay, app)
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), store, replay, replay, app)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +348,7 @@ func TestEventAppenderResultMustMatchRequest(t *testing.T) {
 	config.Clock = clock
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, mismatchedEventAppender{}, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, mismatchedEventAppender{}, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +374,7 @@ func TestDedupACKMustMatchSend(t *testing.T) {
 	config.Clock = clock
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), mismatchedACKStore{}, replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), mismatchedACKStore{}, replay, replay, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}

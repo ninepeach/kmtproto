@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-// Clock is a concurrency-safe value provider. Implementations must return
-// promptly and must not synchronously call back into the protocol object that
-// invoked Now; protocol transitions may sample it while holding state locks.
+// Clock is a concurrency-safe value provider. Protocol objects sample it
+// without holding their state/store mutexes so a synchronous callback cannot
+// deadlock by re-entering the invoking object. Implementations should still
+// return promptly.
 type Clock interface {
 	Now() time.Time
 }

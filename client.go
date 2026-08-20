@@ -43,10 +43,12 @@ type PendingPing struct {
 	Generation ConnectionGeneration
 }
 
-// Client is a concurrency-safe protocol state machine. It does not execute the
-// actions it returns and never calls application or transport code while
-// holding its state lock.
-type Client struct {
+// ClientProtocol is a concurrency-safe client-side protocol state machine. It
+// does not own network connections, open WebSocket/TCP/QUIC connections, or
+// manage transport lifecycle. It only produces protocol actions for its caller
+// to execute and never calls application or transport code while holding its
+// state lock.
+type ClientProtocol struct {
 	mu sync.Mutex
 
 	config       ClientConfig
@@ -71,10 +73,11 @@ type Client struct {
 	gapResume             bool
 }
 
-// NewClient creates a client protocol state machine. Client methods are safe
-// for concurrent use. They never perform network I/O or invoke user callbacks;
-// callers execute the returned actions after each transition completes.
-func NewClient(config ClientConfig) (*Client, error) {
+// NewClientProtocol creates a client-side protocol state machine.
+// ClientProtocol methods are safe for concurrent use. They never perform
+// network I/O or invoke user callbacks; transport lifecycle remains
+// caller-owned and callers execute returned actions after transitions finish.
+func NewClientProtocol(config ClientConfig) (*ClientProtocol, error) {
 	if config.Clock == nil {
 		config.Clock = RealClock{}
 	}
@@ -84,6 +87,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	offers, err := validateAndCopyCapabilityOffers(config.Capabilities, config.Limits)
 	if err != nil {
+		return nil, fmt.Errorf("kmtproto: invalid client capabilities: %w", err)
+	}
+	if err := validateImplementedCapabilityOffers(offers); err != nil {
 		return nil, fmt.Errorf("kmtproto: invalid client capabilities: %w", err)
 	}
 	config.Capabilities = offers
@@ -108,7 +114,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.MaxReplayBytes < 0 || config.MaxStateObjects < 0 || config.MaxStateBytes < 0 {
 		return nil, fmt.Errorf("kmtproto: replay and State limits must be positive")
 	}
-	return &Client{
+	return &ClientProtocol{
 		config:       config,
 		state:        StateDisconnected,
 		eventIDs:     make(map[uint64]string),
@@ -118,25 +124,25 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) State() ConnectionState {
+func (c *ClientProtocol) State() ConnectionState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.state
 }
 
-func (c *Client) Generation() ConnectionGeneration {
+func (c *ClientProtocol) Generation() ConnectionGeneration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.generation
 }
 
-func (c *Client) SessionID() string {
+func (c *ClientProtocol) SessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID
 }
 
-func (c *Client) LastSeq() uint64 {
+func (c *ClientProtocol) LastSeq() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastSeq
@@ -145,7 +151,7 @@ func (c *Client) LastSeq() uint64 {
 // Capabilities returns a defensive copy of the capabilities negotiated for
 // the current logical Session. The result is immutable until the Session is
 // abandoned; reconnect Resume does not renegotiate it.
-func (c *Client) Capabilities() []NegotiatedCapability {
+func (c *ClientProtocol) Capabilities() []NegotiatedCapability {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.List()
@@ -153,7 +159,7 @@ func (c *Client) Capabilities() []NegotiatedCapability {
 
 // CapabilityEnabled reports whether the current Session negotiated the named
 // capability. It returns false before WELCOME and after Session abandonment.
-func (c *Client) CapabilityEnabled(name string) bool {
+func (c *ClientProtocol) CapabilityEnabled(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.Enabled(name)
@@ -162,7 +168,7 @@ func (c *Client) CapabilityEnabled(name string) bool {
 // CapabilityVersion returns the version enabled for the current Session. It
 // returns ok=false before WELCOME, after abandonment, or for an unsupported
 // capability.
-func (c *Client) CapabilityVersion(name string) (version uint16, ok bool) {
+func (c *ClientProtocol) CapabilityVersion(name string) (version uint16, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capabilities.Version(name)
@@ -170,7 +176,7 @@ func (c *Client) CapabilityVersion(name string) (version uint16, ok bool) {
 
 // StateObject returns a defensive copy of the latest accepted State Object.
 // The client cache is process-local protocol state, not persistent storage.
-func (c *Client) StateObject(namespace, objectID string) (StateObject, bool) {
+func (c *ClientProtocol) StateObject(namespace, objectID string) (StateObject, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	object, found := c.stateObjects[StateIdentity{Namespace: namespace, ObjectID: objectID}]
@@ -180,24 +186,16 @@ func (c *Client) StateObject(namespace, objectID string) (StateObject, bool) {
 	return cloneStateObject(object), true
 }
 
-func (c *Client) BeginConnect() ConnectionGeneration {
+func (c *ClientProtocol) BeginConnect() ConnectionGeneration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.generation++
 	c.state = StateConnecting
-	c.pendingPing = nil
-	c.suspectAt = time.Time{}
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = nil
-	c.resumeEventsComplete = false
-	c.gapResume = false
-	c.stateQueries = make(map[string]StateQueryPayload)
+	c.resetConnectionTransientLocked()
 	return c.generation
 }
 
-func (c *Client) TransportConnected(generation ConnectionGeneration) error {
+func (c *ClientProtocol) TransportConnected(generation ConnectionGeneration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -210,7 +208,7 @@ func (c *Client) TransportConnected(generation ConnectionGeneration) error {
 	return nil
 }
 
-func (c *Client) StartSession(generation ConnectionGeneration, clientName string) ([]Action, error) {
+func (c *ClientProtocol) StartSession(generation ConnectionGeneration, clientName string) ([]Action, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -227,16 +225,18 @@ func (c *Client) StartSession(generation ConnectionGeneration, clientName string
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
-func (c *Client) Resume(generation ConnectionGeneration) ([]Action, error) {
+func (c *ClientProtocol) Resume(generation ConnectionGeneration) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.startResumeLocked(generation, nil)
+	return c.startResumeLocked(generation, nil, now)
 }
 
 // ResumeWithState restores the EVENT stream and then requires one complete
 // State snapshot for the requested namespaces before the Session becomes
 // READY. The state-sync capability must already belong to the Session.
-func (c *Client) ResumeWithState(generation ConnectionGeneration, namespaces []string) ([]Action, error) {
+func (c *ClientProtocol) ResumeWithState(generation ConnectionGeneration, namespaces []string) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -250,51 +250,39 @@ func (c *Client) ResumeWithState(generation ConnectionGeneration, namespaces []s
 	if err := validateResumeStateSync(&ResumeStateSync{Namespaces: canonical}, c.config.Limits); err != nil {
 		return nil, err
 	}
-	return c.startResumeLocked(generation, canonical)
+	return c.startResumeLocked(generation, canonical, now)
 }
 
-func (c *Client) startResumeLocked(generation ConnectionGeneration, namespaces []string) ([]Action, error) {
+func (c *ClientProtocol) startResumeLocked(generation ConnectionGeneration, namespaces []string, now time.Time) ([]Action, error) {
 	if generation != c.generation {
 		return nil, ErrStaleConnection
 	}
 	if c.state != StateConnected || c.sessionID == "" {
 		return nil, ErrInvalidState
 	}
-	frame := c.resumeFrameLocked(namespaces)
+	frame := c.resumeFrameLocked(namespaces, now)
 	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
 		return nil, err
 	}
-	c.state = StateResuming
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = append([]string(nil), namespaces...)
-	c.resumeEventsComplete = false
-	c.gapResume = false
+	c.beginRecoveryLocked(namespaces, false)
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
-func (c *Client) Disconnect(generation ConnectionGeneration) error {
+func (c *ClientProtocol) Disconnect(generation ConnectionGeneration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
 		return ErrStaleConnection
 	}
 	c.state = StateDisconnected
-	c.pendingPing = nil
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = nil
-	c.resumeEventsComplete = false
-	c.gapResume = false
-	c.stateQueries = make(map[string]StateQueryPayload)
+	c.resetConnectionTransientLocked()
 	return nil
 }
 
 // QueryState creates a correlated STATE_QUERY for the current READY Session.
 // Query responses are not replayable; a reconnect clears pending queries.
-func (c *Client) QueryState(queryID, namespace string, objectIDs []string) ([]Action, error) {
+func (c *ClientProtocol) QueryState(queryID, namespace string, objectIDs []string) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state != StateReady || c.sessionID == "" {
@@ -311,7 +299,7 @@ func (c *Client) QueryState(queryID, namespace string, objectIDs []string) ([]Ac
 		Type:      FrameStateQuery,
 		ID:        queryID,
 		SessionID: c.sessionID,
-		Timestamp: c.config.Clock.Now().UnixMilli(),
+		Timestamp: now.UnixMilli(),
 		Payload:   mustPayload(payload),
 	}
 	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
@@ -324,7 +312,8 @@ func (c *Client) QueryState(queryID, namespace string, objectIDs []string) ([]Ac
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
-func (c *Client) EnqueueSend(messageID string, content json.RawMessage) ([]Action, error) {
+func (c *ClientProtocol) EnqueueSend(messageID string, content json.RawMessage) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state != StateReady || c.sessionID == "" {
@@ -339,7 +328,7 @@ func (c *Client) EnqueueSend(messageID string, content json.RawMessage) ([]Actio
 	if _, exists := c.outbox[messageID]; exists {
 		return nil, NewProtocolError(ErrorProtocolViolation, "duplicate local message id")
 	}
-	frame := Envelope{V: WireVersionV2, Type: FrameSend, ID: messageID, SessionID: c.sessionID, Timestamp: c.config.Clock.Now().UnixMilli(), Payload: mustPayload(SendPayload{Content: append([]byte(nil), content...)})}
+	frame := Envelope{V: WireVersionV2, Type: FrameSend, ID: messageID, SessionID: c.sessionID, Timestamp: now.UnixMilli(), Payload: mustPayload(SendPayload{Content: append([]byte(nil), content...)})}
 	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
 		return nil, err
 	}
@@ -347,7 +336,7 @@ func (c *Client) EnqueueSend(messageID string, content json.RawMessage) ([]Actio
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
-func (c *Client) RetryPending() ([]Action, error) {
+func (c *ClientProtocol) RetryPending() ([]Action, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state != StateReady {
@@ -365,7 +354,8 @@ func (c *Client) RetryPending() ([]Action, error) {
 	return actions, nil
 }
 
-func (c *Client) SendPing(generation ConnectionGeneration, pingID string) ([]Action, error) {
+func (c *ClientProtocol) SendPing(generation ConnectionGeneration, pingID string) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -374,7 +364,6 @@ func (c *Client) SendPing(generation ConnectionGeneration, pingID string) ([]Act
 	if c.state != StateReady || c.pendingPing != nil || pingID == "" {
 		return nil, ErrInvalidState
 	}
-	now := c.config.Clock.Now()
 	frame := Envelope{V: WireVersionV2, Type: FramePing, SessionID: c.sessionID, Timestamp: now.UnixMilli(), Payload: mustPayload(PingPayload{PingID: pingID, ClientTime: now.UnixMilli()})}
 	if err := validateOutboundFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
 		return nil, err
@@ -383,7 +372,8 @@ func (c *Client) SendPing(generation ConnectionGeneration, pingID string) ([]Act
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
-func (c *Client) CheckHeartbeat(generation ConnectionGeneration) ([]Action, error) {
+func (c *ClientProtocol) CheckHeartbeat(generation ConnectionGeneration) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -392,7 +382,6 @@ func (c *Client) CheckHeartbeat(generation ConnectionGeneration) ([]Action, erro
 	if c.pendingPing == nil {
 		return nil, nil
 	}
-	now := c.config.Clock.Now()
 	if c.state == StateReady && now.Sub(c.pendingPing.SentAt) >= c.config.HeartbeatTimeout {
 		c.state = StateSuspect
 		c.suspectAt = now
@@ -400,13 +389,14 @@ func (c *Client) CheckHeartbeat(generation ConnectionGeneration) ([]Action, erro
 	}
 	if c.state == StateSuspect && now.Sub(c.suspectAt) >= c.config.DisconnectGrace {
 		c.state = StateDisconnected
-		c.pendingPing = nil
+		c.resetConnectionTransientLocked()
 		return []Action{CloseConnectionAction{Reason: "heartbeat timeout"}}, nil
 	}
 	return nil, nil
 }
 
-func (c *Client) HandleIncoming(generation ConnectionGeneration, frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) HandleIncoming(generation ConnectionGeneration, frame Envelope) ([]Action, error) {
+	now := c.config.Clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if generation != c.generation {
@@ -415,9 +405,10 @@ func (c *Client) HandleIncoming(generation ConnectionGeneration, frame Envelope)
 	if err := ValidateFrame(&frame, c.config.Limits, c.config.StrictValidation); err != nil {
 		if frame.Type == FrameError {
 			c.state = StateDisconnected
+			c.resetConnectionTransientLocked()
 			return []Action{CloseConnectionAction{Reason: "invalid ERROR frame"}}, nil
 		}
-		return nil, err
+		return c.handleIncomingFailureLocked(err)
 	}
 	switch frame.Type {
 	case FrameWelcome:
@@ -425,35 +416,41 @@ func (c *Client) HandleIncoming(generation ConnectionGeneration, frame Envelope)
 		// handleWelcomeLocked after decoding its mode and bounds.
 	case FrameError:
 		if frame.SessionID != "" && frame.SessionID != c.sessionID {
-			return nil, NewProtocolError(ErrorProtocolViolation, "ERROR belongs to another session")
+			return c.handleIncomingFailureLocked(NewProtocolError(ErrorProtocolViolation, "ERROR belongs to another session"))
 		}
 	default:
 		if frame.SessionID != c.sessionID {
-			return nil, NewProtocolError(ErrorProtocolViolation, "frame belongs to another session")
+			return c.handleIncomingFailureLocked(NewProtocolError(ErrorProtocolViolation, "frame belongs to another session"))
 		}
 	}
 
+	var actions []Action
+	var err error
 	switch frame.Type {
 	case FrameWelcome:
-		return c.handleWelcomeLocked(frame)
+		actions, err = c.handleWelcomeLocked(frame)
 	case FramePong:
-		return c.handlePongLocked(generation, frame)
+		actions, err = c.handlePongLocked(generation, frame)
 	case FrameAck:
-		return c.handleAckLocked(frame)
+		actions, err = c.handleAckLocked(frame)
 	case FrameEvent:
-		return c.handleEventLocked(frame)
+		actions, err = c.handleEventLocked(frame, now)
 	case FrameStateSnapshot:
-		return c.handleStateSnapshotLocked(frame)
+		actions, err = c.handleStateSnapshotLocked(frame)
 	case FrameStateUpdate:
-		return c.handleStateUpdateLocked(frame)
+		actions, err = c.handleStateUpdateLocked(frame)
 	case FrameError:
-		return c.handleErrorLocked(frame)
+		actions, err = c.handleErrorLocked(frame)
 	default:
-		return nil, NewProtocolError(ErrorProtocolViolation, "unexpected server frame type")
+		err = NewProtocolError(ErrorProtocolViolation, "unexpected server frame type")
 	}
+	if err != nil {
+		return c.handleIncomingFailureLocked(err)
+	}
+	return actions, nil
 }
 
-func (c *Client) handleStateSnapshotLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleStateSnapshotLocked(frame Envelope) ([]Action, error) {
 	if c.state == StateResuming {
 		return c.handleResumeStateSnapshotLocked(frame)
 	}
@@ -491,7 +488,7 @@ func (c *Client) handleStateSnapshotLocked(frame Envelope) ([]Action, error) {
 	return actions, nil
 }
 
-func (c *Client) handleResumeStateSnapshotLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleResumeStateSnapshotLocked(frame Envelope) ([]Action, error) {
 	if !stateSyncEnabled(c.capabilities) || len(c.resumeStateNamespaces) == 0 {
 		return nil, NewProtocolError(ErrorProtocolViolation, "unexpected resume STATE_SNAPSHOT")
 	}
@@ -522,18 +519,13 @@ func (c *Client) handleResumeStateSnapshotLocked(frame Envelope) ([]Action, erro
 		actions = append(actions, DeliverEventAction{Event: copyEnvelope(event)})
 	}
 	actions = append(actions, stateActions...)
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = nil
-	c.resumeEventsComplete = false
-	c.gapResume = false
+	c.resetConnectionTransientLocked()
 	c.state = StateReady
 	actions = append(actions, SessionReadyAction{SessionID: c.sessionID})
 	return actions, nil
 }
 
-func (c *Client) handleStateUpdateLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleStateUpdateLocked(frame Envelope) ([]Action, error) {
 	if c.state != StateReady {
 		return nil, ErrInvalidState
 	}
@@ -547,7 +539,7 @@ func (c *Client) handleStateUpdateLocked(frame Envelope) ([]Action, error) {
 	return c.applyStateObjectsLocked([]StateObject{payload.State})
 }
 
-func (c *Client) applyStateObjectsLocked(objects []StateObject) ([]Action, error) {
+func (c *ClientProtocol) applyStateObjectsLocked(objects []StateObject) ([]Action, error) {
 	next := make(map[StateIdentity]StateObject, len(c.stateObjects)+len(objects))
 	for identity, object := range c.stateObjects {
 		next[identity] = object
@@ -589,7 +581,7 @@ func (c *Client) applyStateObjectsLocked(objects []StateObject) ([]Action, error
 	return actions, nil
 }
 
-func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 	var payload WelcomePayload
 	if err := decodePayload(frame.Payload, &payload, c.config.StrictValidation); err != nil {
 		return nil, err
@@ -633,6 +625,7 @@ func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 			if len(c.resumeStateNamespaces) > 0 {
 				return nil, nil
 			}
+			c.resetConnectionTransientLocked()
 			c.state = StateReady
 			return []Action{SessionReadyAction{SessionID: c.sessionID}}, nil
 		}
@@ -642,7 +635,7 @@ func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 	}
 }
 
-func (c *Client) handlePongLocked(generation ConnectionGeneration, frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handlePongLocked(generation ConnectionGeneration, frame Envelope) ([]Action, error) {
 	if c.state != StateReady && c.state != StateSuspect {
 		return nil, ErrInvalidState
 	}
@@ -661,7 +654,7 @@ func (c *Client) handlePongLocked(generation ConnectionGeneration, frame Envelop
 	return nil, nil
 }
 
-func (c *Client) handleAckLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleAckLocked(frame Envelope) ([]Action, error) {
 	if c.state != StateReady && c.state != StateSuspect {
 		return nil, ErrInvalidState
 	}
@@ -676,7 +669,7 @@ func (c *Client) handleAckLocked(frame Envelope) ([]Action, error) {
 	return []Action{AckedAction{MessageID: payload.RefID}}, nil
 }
 
-func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleEventLocked(frame Envelope, now time.Time) ([]Action, error) {
 	if c.state != StateReady && c.state != StateResuming {
 		return nil, ErrInvalidState
 	}
@@ -723,36 +716,31 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 			c.rememberEventLocked(event.Seq, event.ID)
 			actions = append(actions, DeliverEventAction{Event: copyEnvelope(event)})
 		}
-		c.replayBuffer = nil
-		c.replayTo = 0
-		c.replayBytes = 0
-		c.resumeEventsComplete = false
-		c.gapResume = false
+		c.resetConnectionTransientLocked()
 		c.state = StateReady
 		actions = append(actions, SessionReadyAction{SessionID: c.sessionID})
 		return actions, nil
 	}
 
 	if frame.Seq > c.lastSeq+1 {
-		c.state = StateResuming
-		c.replayBuffer = nil
-		c.replayTo = 0
-		c.replayBytes = 0
-		c.resumeStateNamespaces = nil
-		c.resumeEventsComplete = false
-		c.gapResume = true
-		return []Action{SendFrameAction{Frame: c.resumeFrameLocked(nil)}}, nil
+		resume := c.resumeFrameLocked(nil, now)
+		if err := validateOutboundFrame(&resume, c.config.Limits, c.config.StrictValidation); err != nil {
+			return nil, err
+		}
+		c.beginRecoveryLocked(nil, true)
+		return []Action{SendFrameAction{Frame: resume}}, nil
 	}
 	c.lastSeq = frame.Seq
 	c.rememberEventLocked(frame.Seq, frame.ID)
 	return []Action{DeliverEventAction{Event: copyEnvelope(frame)}}, nil
 }
 
-func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
+func (c *ClientProtocol) handleErrorLocked(frame Envelope) ([]Action, error) {
 	var payload ErrorPayload
 	if err := decodePayload(frame.Payload, &payload, c.config.StrictValidation); err != nil {
 		// An invalid ERROR never causes another ERROR frame.
 		c.state = StateDisconnected
+		c.resetConnectionTransientLocked()
 		return []Action{CloseConnectionAction{Reason: "invalid ERROR frame"}}, nil
 	}
 	if payload.RefID != "" {
@@ -760,44 +748,65 @@ func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
 	}
 	actions := []Action{ProtocolErrorAction{Error: payload}}
 	behavior, _ := BehaviorForErrorCode(payload.Code)
-	if c.state == StateResuming && behavior.FullSyncRequired {
+	wasResuming := c.state == StateResuming
+	stateRecovery := len(c.resumeStateNamespaces) > 0
+	sessionID := c.sessionID
+	needClose := behavior.CloseConnection
+	if wasResuming {
 		c.state = StateDisconnected
-		c.replayBuffer = nil
-		c.replayTo = 0
-		c.replayBytes = 0
-		c.resumeStateNamespaces = nil
-		c.resumeEventsComplete = false
-		c.gapResume = false
-		actions = append(actions, FullSyncRequiredAction{SessionID: c.sessionID})
+		c.resetConnectionTransientLocked()
+		if behavior.FullSyncRequired || behavior.AbandonSession || (stateRecovery && payload.Code == ErrorStateSyncRequired) {
+			actions = append(actions, FullSyncRequiredAction{SessionID: sessionID})
+		} else if !needClose {
+			// Every rejected Resume attempt is terminal. Retryable errors may be
+			// retried only after the caller establishes a new connection.
+			needClose = true
+		}
 	}
 	if behavior.AbandonSession {
 		c.abandonSessionLocked()
 	}
-	if behavior.CloseConnection {
+	if needClose {
 		c.state = StateDisconnected
-		c.pendingPing = nil
-		c.replayBuffer = nil
-		c.replayTo = 0
-		c.replayBytes = 0
-		c.resumeStateNamespaces = nil
-		c.resumeEventsComplete = false
-		c.gapResume = false
+		c.resetConnectionTransientLocked()
 		actions = append(actions, CloseConnectionAction{Reason: payload.Code})
 	}
 	return actions, nil
 }
 
-func (c *Client) abandonSessionLocked() {
+func (c *ClientProtocol) abandonSessionLocked() {
 	c.state = StateDisconnected
 	c.sessionID = ""
 	c.lastSeq = 0
 	c.eventIDs = make(map[uint64]string)
 	c.outbox = make(map[string]Envelope)
-	c.pendingPing = nil
-	c.suspectAt = time.Time{}
 	c.capabilities = SessionCapabilities{}
 	c.stateObjects = make(map[StateIdentity]StateObject)
 	c.stateBytes = 0
+	c.resetConnectionTransientLocked()
+}
+
+func (c *ClientProtocol) handleIncomingFailureLocked(err error) ([]Action, error) {
+	if c.state != StateResuming {
+		return nil, err
+	}
+	reason := "resume failed: " + err.Error()
+	if len(c.resumeStateNamespaces) > 0 {
+		return c.stopStateResumeLocked(reason), nil
+	}
+	return c.stopReplayLocked(reason), nil
+}
+
+func (c *ClientProtocol) beginRecoveryLocked(namespaces []string, gap bool) {
+	c.resetConnectionTransientLocked()
+	c.state = StateResuming
+	c.resumeStateNamespaces = append([]string(nil), namespaces...)
+	c.gapResume = gap
+}
+
+func (c *ClientProtocol) resetConnectionTransientLocked() {
+	c.pendingPing = nil
+	c.suspectAt = time.Time{}
 	c.stateQueries = make(map[string]StateQueryPayload)
 	c.replayBuffer = nil
 	c.replayTo = 0
@@ -807,30 +816,24 @@ func (c *Client) abandonSessionLocked() {
 	c.gapResume = false
 }
 
-func (c *Client) resumeFrameLocked(namespaces []string) Envelope {
+func (c *ClientProtocol) resumeFrameLocked(namespaces []string, now time.Time) Envelope {
 	payload := ResumePayload{LastSeq: c.lastSeq}
 	if len(namespaces) > 0 {
 		payload.StateSync = &ResumeStateSync{Namespaces: append([]string(nil), namespaces...)}
 	}
-	return Envelope{V: WireVersionV2, Type: FrameResume, SessionID: c.sessionID, Timestamp: c.config.Clock.Now().UnixMilli(), Payload: mustPayload(payload)}
+	return Envelope{V: WireVersionV2, Type: FrameResume, SessionID: c.sessionID, Timestamp: now.UnixMilli(), Payload: mustPayload(payload)}
 }
 
-func (c *Client) rememberEventLocked(seq uint64, eventID string) {
+func (c *ClientProtocol) rememberEventLocked(seq uint64, eventID string) {
 	c.eventIDs[seq] = eventID
 	if seq > c.config.EventIdentityWindow {
 		delete(c.eventIDs, seq-c.config.EventIdentityWindow)
 	}
 }
 
-func (c *Client) stopReplayLocked(reason string) []Action {
+func (c *ClientProtocol) stopReplayLocked(reason string) []Action {
 	c.state = StateDisconnected
-	c.pendingPing = nil
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = nil
-	c.resumeEventsComplete = false
-	c.gapResume = false
+	c.resetConnectionTransientLocked()
 	return []Action{
 		ProtocolErrorAction{Error: ErrorPayload{Code: ErrorSyncRequired, Message: reason, Retryable: false}},
 		FullSyncRequiredAction{SessionID: c.sessionID},
@@ -838,17 +841,12 @@ func (c *Client) stopReplayLocked(reason string) []Action {
 	}
 }
 
-func (c *Client) stopStateResumeLocked(reason string) []Action {
+func (c *ClientProtocol) stopStateResumeLocked(reason string) []Action {
 	c.state = StateDisconnected
-	c.pendingPing = nil
-	c.replayBuffer = nil
-	c.replayTo = 0
-	c.replayBytes = 0
-	c.resumeStateNamespaces = nil
-	c.resumeEventsComplete = false
-	c.gapResume = false
+	c.resetConnectionTransientLocked()
 	return []Action{
 		ProtocolErrorAction{Error: ErrorPayload{Code: ErrorStateSyncRequired, Message: reason, Retryable: false}},
+		FullSyncRequiredAction{SessionID: c.sessionID},
 		CloseConnectionAction{Reason: reason},
 	}
 }

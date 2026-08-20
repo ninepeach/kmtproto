@@ -48,13 +48,19 @@ Transport adapter
     ↓ WebSocket, TCP, QUIC, or an in-process link
 ```
 
-The protocol core never opens a network connection. `Client` produces `Action` values, `Server` enqueues frames into an `OutboundQueue`, and `SingleWriter` is the only component that serializes bytes to a caller-provided `ByteSender`.
+The protocol core never opens a network connection. `ClientProtocol` is the
+client-side state machine that produces `Action` values; `ServerProtocol` is
+the server-side frame processor/state machine that enqueues frames into an
+`OutboundQueue`. Neither owns a network connection or opens WebSocket, TCP, or
+QUIC connections. Transport lifecycle remains caller-owned, and `SingleWriter`
+is the only reference helper that serializes bytes to a caller-provided
+`ByteSender`.
 
 ## Minimal client flow
 
 ```go
 config := kmtproto.DefaultClientConfig()
-client, err := kmtproto.NewClient(config)
+client, err := kmtproto.NewClientProtocol(config)
 if err != nil {
     panic(err)
 }
@@ -75,7 +81,7 @@ actions, err := client.EnqueueSend("msg_01K...", json.RawMessage(`{"text":"hello
 retryActions, err := client.RetryPending()
 ```
 
-## Server boundary
+## ServerProtocol boundary
 
 `ApplicationHandler` receives the protocol message ID as its idempotency key:
 
@@ -121,7 +127,7 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 - `examples/basic`: end-to-end protocol demonstration
 
 `MemoryDedupStore`, `MemoryReplayStore`, `MemorySessionRepository`,
-`OutboundQueue`, `SingleWriter`, and `ServerConnection` are reference helpers
+`OutboundQueue`, `SingleWriter`, and `ServerAdmission` are reference helpers
 for tests, examples, and simple integrations. They do not make transport,
 backpressure, persistence, or distributed-session policy part of the wire
 protocol. See the [v0.2 final review](docs/review-v0.2-final.md) for the freeze record.

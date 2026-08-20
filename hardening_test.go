@@ -64,7 +64,7 @@ func TestDuplicateBindsToFlightBeforeClaim(t *testing.T) {
 	}
 	replay := NewMemoryReplayStore()
 	app := &recordingApp{}
-	server, err := NewServer(config, NewMemorySessionRepository(), store, replay, replay, app)
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), store, replay, replay, app)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestACKCannotPrecedeComplete(t *testing.T) {
 				fail:     fail,
 			}
 			replay := NewMemoryReplayStore()
-			server, err := NewServer(config, NewMemorySessionRepository(), store, replay, replay, &recordingApp{})
+			server, err := NewServerProtocol(config, NewMemorySessionRepository(), store, replay, replay, &recordingApp{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -205,13 +205,13 @@ func TestResumedWelcomeCarriesExplicitBounds(t *testing.T) {
 	}
 }
 
-func configuredReadyClient(t *testing.T, mutate func(*ClientConfig)) (*Client, *FakeClock, ConnectionGeneration) {
+func configuredReadyClient(t *testing.T, mutate func(*ClientConfig)) (*ClientProtocol, *FakeClock, ConnectionGeneration) {
 	t.Helper()
 	clock := NewFakeClock(time.Unix(4, 0))
 	config := DefaultClientConfig()
 	config.Clock = clock
 	mutate(&config)
-	client, err := NewClient(config)
+	client, err := NewClientProtocol(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func configuredReadyClient(t *testing.T, mutate func(*ClientConfig)) (*Client, *
 	return client, clock, gen
 }
 
-func beginGapReplay(t *testing.T, client *Client, gen ConnectionGeneration, replayTo uint64) {
+func beginGapReplay(t *testing.T, client *ClientProtocol, gen ConnectionGeneration, replayTo uint64) {
 	t.Helper()
 	gap := Envelope{V: WireVersionV2, Type: FrameEvent, ID: "gap", SessionID: "s_1", Seq: replayTo + 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})}
 	if _, err := client.HandleIncoming(gen, gap); err != nil {
@@ -368,21 +368,22 @@ func TestInvalidClientStateTransitionsAndOldWelcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	unexpectedNew := Envelope{V: WireVersionV2, Type: FrameWelcome, SessionID: "s_1", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})}
-	if _, err := client.HandleIncoming(newGen, unexpectedNew); err == nil {
-		t.Fatal("NEW WELCOME accepted during RESUMING")
+	actions, err := client.HandleIncoming(newGen, unexpectedNew)
+	if err != nil || client.State() != StateDisconnected || !hasFullSyncAction(actions, "s_1") {
+		t.Fatalf("invalid resume acknowledgement was not terminal: actions=%#v state=%s err=%v", actions, client.State(), err)
 	}
 }
 
-func TestServerConnectionAdmissionState(t *testing.T) {
+func TestServerAdmissionState(t *testing.T) {
 	app := &recordingApp{}
 	server, _, _ := newTestServer(t, app)
-	connection := NewServerConnection()
+	connection := NewServerAdmission()
 	gen, out := connection.Replace()
 	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "m", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
 	if err := connection.Handle(context.Background(), server, gen, send); err != nil {
 		t.Fatal(err)
 	}
-	if frame := nextTestFrame(t, out); frame.Type != FrameError || connection.State() != ServerConnectionClosed || app.count() != 0 {
+	if frame := nextTestFrame(t, out); frame.Type != FrameError || connection.State() != ServerAdmissionClosed || app.count() != 0 {
 		t.Fatalf("pre-handshake SEND was not rejected: frame=%#v state=%s calls=%d", frame, connection.State(), app.count())
 	}
 
@@ -392,13 +393,13 @@ func TestServerConnectionAdmissionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	welcome := nextTestFrame(t, out)
-	if welcome.Type != FrameWelcome || connection.State() != ServerConnectionReady || connection.SessionID() != "s_1" {
+	if welcome.Type != FrameWelcome || connection.State() != ServerAdmissionReady || connection.SessionID() != "s_1" {
 		t.Fatalf("handshake state: frame=%#v state=%s session=%q", welcome, connection.State(), connection.SessionID())
 	}
 	if err := connection.Handle(context.Background(), server, gen, hello); err != nil {
 		t.Fatal(err)
 	}
-	if frame := nextTestFrame(t, out); frame.Type != FrameError || connection.State() != ServerConnectionClosed {
+	if frame := nextTestFrame(t, out); frame.Type != FrameError || connection.State() != ServerAdmissionClosed {
 		t.Fatalf("second HELLO accepted: frame=%#v state=%s", frame, connection.State())
 	}
 
@@ -407,7 +408,7 @@ func TestServerConnectionAdmissionState(t *testing.T) {
 	if err := connection.Handle(context.Background(), server, gen, resume); err != nil {
 		t.Fatal(err)
 	}
-	if frame := nextTestFrame(t, out); frame.Type != FrameWelcome || connection.State() != ServerConnectionReady {
+	if frame := nextTestFrame(t, out); frame.Type != FrameWelcome || connection.State() != ServerAdmissionReady {
 		t.Fatalf("resume state: frame=%#v state=%s", frame, connection.State())
 	}
 }
@@ -419,7 +420,7 @@ func TestServerReplayEventLimitReturnsSyncRequired(t *testing.T) {
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	config.MaxReplayEvents = 2
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,11 +469,11 @@ func TestServerReplayByteLimitReturnsSyncRequired(t *testing.T) {
 	}
 }
 
-func TestGapResumeAcceptedOnReadyServerConnection(t *testing.T) {
+func TestGapResumeAcceptedOnReadyServerAdmission(t *testing.T) {
 	server, clock, _ := newTestServer(t, &recordingApp{})
 	clientConfig := DefaultClientConfig()
 	clientConfig.Clock = clock
-	client, err := NewClient(clientConfig)
+	client, err := NewClientProtocol(clientConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +486,7 @@ func TestGapResumeAcceptedOnReadyServerConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	connection := NewServerConnection()
+	connection := NewServerAdmission()
 	serverGeneration, outbound := connection.Replace()
 	if err := connection.Handle(context.Background(), server, serverGeneration, helloActions[0].(SendFrameAction).Frame); err != nil {
 		t.Fatal(err)
@@ -511,7 +512,7 @@ func TestGapResumeAcceptedOnReadyServerConnection(t *testing.T) {
 	if err := connection.Handle(context.Background(), server, serverGeneration, resume); err != nil {
 		t.Fatal(err)
 	}
-	if connection.State() != ServerConnectionReady {
+	if connection.State() != ServerAdmissionReady {
 		t.Fatalf("server connection did not return to READY: %s", connection.State())
 	}
 
@@ -531,7 +532,7 @@ func TestGapResumeAcceptedOnReadyServerConnection(t *testing.T) {
 }
 
 func TestStreamLaneRecoversFromPanic(t *testing.T) {
-	server := &Server{lanes: make(map[string]*streamLane)}
+	server := &ServerProtocol{lanes: make(map[string]*streamLane)}
 	if err := server.runStream("s", func(*streamLane) error { panic("boom") }); err == nil {
 		t.Fatal("expected recovered panic error")
 	}
@@ -541,7 +542,7 @@ func TestStreamLaneRecoversFromPanic(t *testing.T) {
 }
 
 type reentrantEventAppender struct {
-	server   *Server
+	server   *ServerProtocol
 	delegate EventAppender
 	outbound *OutboundQueue
 	result   error
@@ -560,7 +561,7 @@ func TestEventAppenderCallbackReentryFailsWithoutDeadlock(t *testing.T) {
 	replay := NewMemoryReplayStore()
 	nestedOutbound := NewOutboundQueue()
 	appender := &reentrantEventAppender{delegate: replay, outbound: nestedOutbound}
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, appender, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, appender, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +717,7 @@ func TestOnlyEventChangesLastSequence(t *testing.T) {
 	}
 }
 
-func TestServerConnectionReplacementFencesLateHandshake(t *testing.T) {
+func TestServerAdmissionReplacementFencesLateHandshake(t *testing.T) {
 	clock := NewFakeClock(time.Unix(6, 0))
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -728,11 +729,11 @@ func TestServerConnectionReplacementFencesLateHandshake(t *testing.T) {
 		return "s_old", nil
 	}
 	replay := NewMemoryReplayStore()
-	server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
+	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, &recordingApp{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := NewServerConnection()
+	connection := NewServerAdmission()
 	oldGeneration, _ := connection.Replace()
 	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
 	done := make(chan error, 1)
@@ -741,7 +742,7 @@ func TestServerConnectionReplacementFencesLateHandshake(t *testing.T) {
 	newGeneration, _ := connection.Replace()
 	close(release)
 	_ = <-done
-	if connection.State() != ServerConnectionAwaitingHandshake || connection.SessionID() != "" || connection.Generation() != newGeneration {
+	if connection.State() != ServerAdmissionAwaitingHandshake || connection.SessionID() != "" || connection.Generation() != newGeneration {
 		t.Fatalf("late handshake mutated replacement: state=%s session=%q", connection.State(), connection.SessionID())
 	}
 }
@@ -794,7 +795,7 @@ func TestPreCompleteFailureWindowsNeverRepeatApplication(t *testing.T) {
 			config.FailureInjector = failAt(point)
 			replay := NewMemoryReplayStore()
 			app := &recordingApp{}
-			server, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
+			server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
 			if err != nil {
 				t.Fatal(err)
 			}

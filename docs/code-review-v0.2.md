@@ -48,23 +48,23 @@ Resolution Record in section 9 for the corrected working tree.
 ### Confirmed
 
 - The package imports only the Go standard library.
-- `Client` produces protocol Actions and owns no transport.
-- `Server` consumes typed Frames and writes to a caller-owned `OutboundQueue`;
+- `ClientProtocol` produces protocol Actions and owns no transport.
+- `ServerProtocol` consumes typed Frames and writes to a caller-owned `OutboundQueue`;
   it owns no listener, connection registry, or reconnect loop.
 - `ApplicationHandler`, `ReplayStore`, `EventAppender`, `StateStore`,
   `StateSnapshotProvider`, and `SessionRepository` are interfaces rather than
   database assumptions.
 - `MemoryDedupStore`, `MemoryReplayStore`, `MemorySessionRepository`,
-  `OutboundQueue`, `SingleWriter`, and `ServerConnection` are reference/helper
+  `OutboundQueue`, `SingleWriter`, and `ServerAdmission` are reference/helper
   implementations, not required wire components.
 - State data, SEND content, EVENT content, and event types remain
   application-opaque.
 
 ### Boundary clarification needed
 
-`Server.HandleIncoming` does not enforce connection admission state; only
-`ServerConnection.Handle` does. This is a valid separation, but the public API
-should state unambiguously that callers bypassing `ServerConnection` MUST
+`ServerProtocol.HandleIncoming` does not enforce connection admission state; only
+`ServerAdmission.Handle` does. This is a valid separation, but the public API
+should state unambiguously that callers bypassing `ServerAdmission` MUST
 provide equivalent per-connection admission and serialization. Otherwise a
 caller can invoke repeated HELLO or out-of-state Frames directly against the
 processor.
@@ -92,7 +92,7 @@ highest common version, and the public test deliberately negotiates version 2
 - Server query, live update, and Resume paths: `server.go:190-200`,
   `293-317`, and `456-470`.
 
-Consequently a Session negotiated as `state-sync@2` uses the v1 State Frame
+Consequently a Session negotiated as `{name:"state-sync", version:2}` uses the v1 State Frame
 grammar and semantics. This defeats capability versioning and makes an
 incompatible future capability version unsafe.
 
@@ -164,7 +164,7 @@ that flight to finish (`server.go:436-453`). Unlike `streamLane`, this mechanism
 has no callback-re-entry guard.
 
 If an injected `ServerSessionStore.Claim` or `ApplicationHandler.HandleSend`
-synchronously re-enters `Server.HandleIncoming` for the same
+synchronously re-enters `ServerProtocol.HandleIncoming` for the same
 `(session_id,msg_id)`, the nested call sees the existing flight and waits on the
 outer call. The outer callback cannot return until the nested call returns, so
 the flight can never close. With a non-cancelled context this is an unbounded
@@ -266,7 +266,7 @@ repository should implement it.
 
 #### M-06: configured TTL invariants are disconnected from the injected store
 
-`NewServer` validates relationships among `ServerConfig` TTL values
+`NewServerProtocol` validates relationships among `ServerConfig` TTL values
 (`server.go:125-133`), but `ServerSessionStore` does not expose or promise its
 retention window. A caller can inject `MemoryDedupStore` with a shorter TTL than
 `ServerConfig.DedupTTL`; the constructor still accepts it and completed duplicate
@@ -292,7 +292,7 @@ RawMessage, but direct public `ValidateFrame` calls can reach this inconsistency
 
 #### M-08: injected Clock calls occur while protocol/store locks are held
 
-Client operations call `Clock.Now` while holding `Client.mu` (for example
+ClientProtocol operations call `Clock.Now` while holding `ClientProtocol.mu` (for example
 `client.go:293-320`, `364-401`), and `MemoryDedupStore` calls its Clock while
 holding the store mutex (`store.go:129-161`). Clock is an injected interface, so
 the absolute documentation statement that no lock is held across user
@@ -316,7 +316,7 @@ EVENT before sequence exhaustion.
 
 #### L-01: reference maps have unbounded lifetime growth
 
-`Server.lanes` is never retired, and `MemoryReplayStore.ids` retains every event
+`ServerProtocol.lanes` is never retired, and `MemoryReplayStore.ids` retains every event
 ID even after events are pruned (`server.go:714-722`, `store.go:208-225`,
 `295-309`). This is not a wire correctness failure and the components are
 reference helpers, but long-lived process-local use can grow memory by Session
@@ -346,7 +346,7 @@ delivery.
 - Client mutable state is serialized by one mutex.
 - Session capabilities expose defensive lists and have no mutation API.
 - Memory stores and OutboundQueue protect process-local data.
-- ServerConnection applies async results only when both generation and queue
+- ServerAdmission applies async results only when both generation and queue
   still match (`server.go:928-960`).
 - Replay and live EVENT/STATE publication share a per-Session stream lane.
 - The stream lane releases its mutex around callbacks, fails fast on same-lane
@@ -362,7 +362,7 @@ delivery.
   cannot detect logical deadlock.
 - M-04 is an ordering race across two independently safe output paths.
 - M-08 contradicts the documented callback/lock boundary for injected Clocks.
-- Concurrent HELLO calls admitted against one `ServerConnection` are memory-safe
+- Concurrent HELLO calls admitted against one `ServerAdmission` are memory-safe
   but can leave an orphan Session: the second call closes admission while the
   first already-running handler may still create protocol Session state. A
   single reader/caller-serialization requirement should be explicit if this
@@ -377,7 +377,7 @@ delivery.
 | Negotiated capabilities are immutable | PASS | Defensive Session capability snapshots |
 | Feature use matches negotiated capability version | **FAIL** | H-01 |
 | Invalid transitions are deterministic | PASS with High gap | General matrix is strong; H-02 and H-04 are incorrect dispositions |
-| Stale generation cannot mutate current Client/connection state | PASS | Client entry fence and ServerConnection result fence |
+| Stale generation cannot mutate current ClientProtocol/admission state | PASS | ClientProtocol entry fence and ServerAdmission result fence |
 | ACK occurs only after Complete | PASS | Failure tests and direct flow prove boundary |
 | Duplicate SEND never repeats Application while PROCESSING/COMPLETED | PASS | Flight plus atomic Claim; re-entry deadlocks rather than repeats |
 | Same SEND identity denotes one immutable logical request | **FAIL** | H-06 |
@@ -404,7 +404,7 @@ safety.
 
 Measured statement coverage is 78.6%. The raw percentage is acceptable for a
 protocol core, but weakly exercised functions align with actual review risk:
-`Client.handleErrorLocked` is 58.5% covered and `Server.waitForOriginal` is
+`ClientProtocol.handleErrorLocked` is 58.5% covered and `ServerProtocol.waitForOriginal` is
 18.2% covered.
 
 Missing invariant tests, in priority order:
@@ -466,8 +466,8 @@ Type, transport, business feature, or persistence implementation.
 
 | Finding | Resolution | Regression proof |
 |---|---|---|
-| H-01 capability version gate | Resolved: all built-in State operations require exact `state-sync@1`; a negotiated version 2 remains visible but cannot invoke v1 semantics | `TestStateFramesRequireExactCapabilityVersion` |
-| H-02 INVALID_SESSION disposition | Resolved: Client abandonment is state-independent; READY ServerConnection PING/SEND paths also return to awaiting handshake | `TestInvalidSessionAlwaysAbandonsClientSession`, `TestInvalidSessionAbandonsServerConnection` |
+| H-01 capability version gate | Resolved: all built-in State operations require exact `{name:"state-sync", version:1}`; configuration rejects unimplemented built-in versions | `TestStateSyncCapabilityConfigRequiresImplementedNumericVersion` |
+| H-02 INVALID_SESSION disposition | Resolved: ClientProtocol abandonment is state-independent; READY ServerAdmission PING/SEND paths also return to awaiting handshake | `TestInvalidSessionAlwaysAbandonsClientSession`, `TestInvalidSessionAbandonsServerAdmission` |
 | H-03 wrong-Session ERROR | Resolved: non-empty ERROR Session IDs are correlated before any Client mutation | `TestWrongSessionErrorCannotMutateClient` |
 | H-04 pre-WELCOME Gap EVENT | Resolved: only same-connection Gap recovery discards superseded in-flight EVENTs without delivery or sequence advance; reconnect Resume remains strict | `TestGapRecoveryIgnoresPreWelcomeInflightEvents` |
 | H-05 same-SEND re-entry | Resolved: SEND flights mark injected callbacks; same-identity callback re-entry receives a retryable indeterminate ERROR instead of waiting on itself | `TestSameSendApplicationReentryFailsFast`, `TestSameSendStoreReentryFailsFast` |
@@ -484,10 +484,10 @@ Type, transport, business feature, or persistence implementation.
 | M-05 Session ID collision | Resolved: repository Create atomically rejects `ErrSessionExists`; the Server returns deterministic INTERNAL |
 | M-06 configured/store TTL gap | Resolved by mandatory Store retention contract and optional `DedupRetentionReporter` constructor verification; the memory store reports its TTL |
 | M-07 duplicate JSON members | Resolved in strict mode for Envelope and typed payload objects; opaque SEND/EVENT content and State data remain opaque |
-| M-08 Clock under lock | Accepted with explicit contract: Clock is a prompt, concurrency-safe, non-re-entrant value provider, not a general callback |
+| M-08 Clock under lock | Resolved: Client and memory dedup transitions sample Clock values before acquiring their state/store mutexes |
 | M-09 replay bound overflow | Resolved with subtraction-safe bound validation and a MaxUint64 regression test |
 | L-01 helper map growth | Partially resolved: idle stream lanes are reference-counted and retired; replay event-ID retention remains an explicit process-local helper tradeoff |
-| L-02 default generator Clock | Resolved: default ID generators are bound by `NewServer` after the final configured Clock is known |
+| L-02 default generator Clock | Resolved: default ID generators are bound by `NewServerProtocol` after the final configured Clock is known |
 | L-03 local Action execution | Accepted/out of scope: action emission remains the documented process-local delivery boundary |
 
 ### Additional safety corrections
@@ -518,8 +518,9 @@ provided fingerprint atomically with a new PROCESSING claim and preserve it
 through Complete.
 
 `DefaultServerConfig` now leaves ID generator functions unset until
-`NewServer`, so they bind to the final configured Clock. Callers that invoked a
-default generator directly before constructing a Server must instead use
+`NewServerProtocol`, so they bind to the final configured Clock. Callers that
+invoked a default generator directly before constructing a `ServerProtocol`
+must instead use
 `DefaultSessionIDGenerator`/`DefaultFrameIDGenerator` explicitly.
 
 ### Post-fix recommendation

@@ -68,7 +68,7 @@ The client transition causes are fixed:
 | any active state | caller disconnect, fatal ERROR, or replay safety limit | DISCONNECTED |
 
 Other state/frame combinations return a deterministic protocol/state error; they
-are not silently accepted. `ServerConnection` is the optional reference
+are not silently accepted. `ServerAdmission` is the optional reference
 server-side admission gate: each replacement begins in `AWAITING_HANDSHAKE`, a
 successful HELLO or RESUME enters `READY`, and a fatal violation enters
 `CLOSED`.
@@ -181,7 +181,7 @@ An outstanding ping records ID, monotonic send time, and connection generation. 
 Timeouts use local duration arithmetic, not wire timestamps or `server_time - client_time`.
 
 Tests that replace `ServerConfig.Clock` should also set `NewSessionID` to a
-deterministic generator, or set it to nil so `NewServer` derives the default
+deterministic generator, or set it to nil so `NewServerProtocol` derives the default
 generator from the configured clock. This keeps ID generation deterministic
 without changing the public default configuration behavior.
 
@@ -222,13 +222,13 @@ heartbeat, errors, and actions are protocol core.
 
 | Object | Concurrent use | Role and limitation |
 |---|---|---|
-| `Client` | safe | serializes transitions; caller executes returned actions |
-| `Server` | safe if injected interfaces honor their contracts | frame processor; no transport ownership |
+| `ClientProtocol` | safe | client-side protocol state machine; caller executes returned actions; no transport ownership |
+| `ServerProtocol` | safe if injected interfaces honor their contracts | server-side frame processor/state machine; no transport ownership |
 | `MemoryDedupStore` | safe | process-local reference; completed ACK TTL, no durable recovery |
 | `MemoryReplayStore` | safe | process-local reference; caller chooses pruning/persistence |
 | `MemorySessionRepository` | safe | process-local reference only |
 | `OutboundQueue` | safe | unbounded reference FIFO; production backpressure is caller policy |
-| `ServerConnection` | safe | reference admission/generation gate, not a registry or lifecycle manager |
+| `ServerAdmission` | safe | reference admission/generation gate, not a network connection, registry, or lifecycle manager |
 | `JSONCodec` | safe if configuration is immutable during use | bounded v0.1 wire codec |
 | `SingleWriter` | one active `Run`; queue may have concurrent producers | reference single serialization point |
 | `FakeClock` | safe | deterministic tests only |
