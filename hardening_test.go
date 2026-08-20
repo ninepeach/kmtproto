@@ -13,12 +13,12 @@ import (
 func TestProcessingDedupClaimDoesNotExpire(t *testing.T) {
 	clock := NewFakeClock(time.Unix(1, 0))
 	store := NewMemoryDedupStore(clock, time.Minute)
-	claimed, _, err := store.Claim("s", "m")
+	claimed, _, err := store.Claim("s", "m", SendFingerprint{})
 	if err != nil || !claimed {
 		t.Fatalf("first claim: claimed=%v err=%v", claimed, err)
 	}
 	clock.Advance(2 * time.Minute)
-	claimed, record, err := store.Claim("s", "m")
+	claimed, record, err := store.Claim("s", "m", SendFingerprint{})
 	if err != nil || claimed || record == nil || record.State != DedupProcessing {
 		t.Fatalf("active claim expired: claimed=%v record=%#v err=%v", claimed, record, err)
 	}
@@ -32,7 +32,7 @@ type blockingFirstClaimStore struct {
 	release  chan struct{}
 }
 
-func (s *blockingFirstClaimStore) Claim(sessionID, msgID string) (bool, *DedupRecord, error) {
+func (s *blockingFirstClaimStore) Claim(sessionID, msgID string, fingerprint SendFingerprint) (bool, *DedupRecord, error) {
 	s.mu.Lock()
 	s.calls++
 	call := s.calls
@@ -41,7 +41,7 @@ func (s *blockingFirstClaimStore) Claim(sessionID, msgID string) (bool, *DedupRe
 		close(s.started)
 		<-s.release
 	}
-	return s.delegate.Claim(sessionID, msgID)
+	return s.delegate.Claim(sessionID, msgID, fingerprint)
 }
 
 func (s *blockingFirstClaimStore) Complete(sessionID, msgID string, ack *Envelope) error {
@@ -74,10 +74,15 @@ func TestDuplicateBindsToFlightBeforeClaim(t *testing.T) {
 	go func() { firstDone <- server.HandleIncoming(context.Background(), send, NewOutboundQueue()) }()
 	<-store.started
 
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := server.HandleIncoming(cancelled, send, NewOutboundQueue()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("duplicate did not bind to pre-Claim flight: %v", err)
+	duplicateOut := NewOutboundQueue()
+	if err := server.HandleIncoming(context.Background(), send, duplicateOut); err != nil {
+		t.Fatalf("duplicate did not fail fast while Claim callback was active: %v", err)
+	}
+	duplicateError := nextTestFrame(t, duplicateOut)
+	var duplicatePayload ErrorPayload
+	if duplicateError.Type != FrameError || decodePayload(duplicateError.Payload, &duplicatePayload, true) != nil ||
+		duplicatePayload.Code != ErrorInternal || !duplicatePayload.Retryable {
+		t.Fatalf("duplicate callback response = %#v payload=%#v", duplicateError, duplicatePayload)
 	}
 	close(store.release)
 	if err := <-firstDone; err != nil {
@@ -95,8 +100,8 @@ type blockingCompleteStore struct {
 	fail     bool
 }
 
-func (s *blockingCompleteStore) Claim(sessionID, msgID string) (bool, *DedupRecord, error) {
-	return s.delegate.Claim(sessionID, msgID)
+func (s *blockingCompleteStore) Claim(sessionID, msgID string, fingerprint SendFingerprint) (bool, *DedupRecord, error) {
+	return s.delegate.Claim(sessionID, msgID, fingerprint)
 }
 
 func (s *blockingCompleteStore) Complete(sessionID, msgID string, ack *Envelope) error {

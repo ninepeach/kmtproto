@@ -152,9 +152,20 @@ func TestConcurrentDuplicateSendCommitsOnceAndReplaysAck(t *testing.T) {
 		}
 	}
 	ack1 := nextTestFrame(t, out1)
-	ack2 := nextTestFrame(t, out2)
-	if ack1.Type != FrameAck || ack2.Type != FrameAck || string(ack1.Payload) != string(ack2.Payload) {
-		t.Fatalf("ACK replay mismatch: %#v %#v", ack1, ack2)
+	duplicateResponse := nextTestFrame(t, out2)
+	if ack1.Type != FrameAck {
+		t.Fatalf("leader did not receive ACK: %#v", ack1)
+	}
+	if duplicateResponse.Type == FrameAck {
+		if string(ack1.Payload) != string(duplicateResponse.Payload) {
+			t.Fatalf("ACK replay mismatch: %#v %#v", ack1, duplicateResponse)
+		}
+	} else {
+		var duplicateError ErrorPayload
+		if duplicateResponse.Type != FrameError || decodePayload(duplicateResponse.Payload, &duplicateError, true) != nil ||
+			duplicateError.Code != ErrorInternal || !duplicateError.Retryable {
+			t.Fatalf("unexpected in-progress duplicate response: %#v payload=%#v", duplicateResponse, duplicateError)
+		}
 	}
 	if app.count() != 1 {
 		t.Fatalf("application called %d times", app.count())
@@ -289,5 +300,11 @@ func TestTTLConfigurationInvariant(t *testing.T) {
 	_, err := NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
 	if err == nil {
 		t.Fatal("expected incompatible TTL rejection")
+	}
+
+	config = DefaultServerConfig()
+	_, err = NewServer(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
+	if err == nil {
+		t.Fatal("expected short injected dedup retention rejection")
 	}
 }

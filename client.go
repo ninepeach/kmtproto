@@ -68,6 +68,7 @@ type Client struct {
 	replayBytes           int
 	resumeStateNamespaces []string
 	resumeEventsComplete  bool
+	gapResume             bool
 }
 
 // NewClient creates a client protocol state machine. Client methods are safe
@@ -191,6 +192,7 @@ func (c *Client) BeginConnect() ConnectionGeneration {
 	c.replayBytes = 0
 	c.resumeStateNamespaces = nil
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	c.stateQueries = make(map[string]StateQueryPayload)
 	return c.generation
 }
@@ -240,8 +242,8 @@ func (c *Client) ResumeWithState(generation ConnectionGeneration, namespaces []s
 	if generation != c.generation {
 		return nil, ErrStaleConnection
 	}
-	if !c.capabilities.Enabled(CapabilityStateSync) {
-		return nil, NewProtocolError(ErrorProtocolViolation, "state-sync capability was not negotiated")
+	if !stateSyncEnabled(c.capabilities) {
+		return nil, NewProtocolError(ErrorProtocolViolation, "state-sync capability version 1 was not negotiated")
 	}
 	canonical := append([]string(nil), namespaces...)
 	sortStrings(canonical)
@@ -268,6 +270,7 @@ func (c *Client) startResumeLocked(generation ConnectionGeneration, namespaces [
 	c.replayBytes = 0
 	c.resumeStateNamespaces = append([]string(nil), namespaces...)
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	return []Action{SendFrameAction{Frame: frame}}, nil
 }
 
@@ -284,6 +287,7 @@ func (c *Client) Disconnect(generation ConnectionGeneration) error {
 	c.replayBytes = 0
 	c.resumeStateNamespaces = nil
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	c.stateQueries = make(map[string]StateQueryPayload)
 	return nil
 }
@@ -296,8 +300,8 @@ func (c *Client) QueryState(queryID, namespace string, objectIDs []string) ([]Ac
 	if c.state != StateReady || c.sessionID == "" {
 		return nil, ErrInvalidState
 	}
-	if !c.capabilities.Enabled(CapabilityStateSync) {
-		return nil, NewProtocolError(ErrorProtocolViolation, "state-sync capability was not negotiated")
+	if !stateSyncEnabled(c.capabilities) {
+		return nil, NewProtocolError(ErrorProtocolViolation, "state-sync capability version 1 was not negotiated")
 	}
 	ids := append([]string(nil), objectIDs...)
 	sortStrings(ids)
@@ -415,8 +419,18 @@ func (c *Client) HandleIncoming(generation ConnectionGeneration, frame Envelope)
 		}
 		return nil, err
 	}
-	if frame.Type != FrameWelcome && frame.Type != FrameError && frame.SessionID != c.sessionID {
-		return nil, NewProtocolError(ErrorProtocolViolation, "frame belongs to another session")
+	switch frame.Type {
+	case FrameWelcome:
+		// NEW WELCOME establishes the Session; RESUMED WELCOME is correlated by
+		// handleWelcomeLocked after decoding its mode and bounds.
+	case FrameError:
+		if frame.SessionID != "" && frame.SessionID != c.sessionID {
+			return nil, NewProtocolError(ErrorProtocolViolation, "ERROR belongs to another session")
+		}
+	default:
+		if frame.SessionID != c.sessionID {
+			return nil, NewProtocolError(ErrorProtocolViolation, "frame belongs to another session")
+		}
 	}
 
 	switch frame.Type {
@@ -446,8 +460,8 @@ func (c *Client) handleStateSnapshotLocked(frame Envelope) ([]Action, error) {
 	if c.state != StateReady {
 		return nil, ErrInvalidState
 	}
-	if !c.capabilities.Enabled(CapabilityStateSync) {
-		return nil, NewProtocolError(ErrorProtocolViolation, "STATE_SNAPSHOT requires state-sync capability")
+	if !stateSyncEnabled(c.capabilities) {
+		return nil, NewProtocolError(ErrorProtocolViolation, "STATE_SNAPSHOT requires state-sync capability version 1")
 	}
 	query, pending := c.stateQueries[frame.ID]
 	if !pending {
@@ -478,7 +492,7 @@ func (c *Client) handleStateSnapshotLocked(frame Envelope) ([]Action, error) {
 }
 
 func (c *Client) handleResumeStateSnapshotLocked(frame Envelope) ([]Action, error) {
-	if !c.capabilities.Enabled(CapabilityStateSync) || len(c.resumeStateNamespaces) == 0 {
+	if !stateSyncEnabled(c.capabilities) || len(c.resumeStateNamespaces) == 0 {
 		return nil, NewProtocolError(ErrorProtocolViolation, "unexpected resume STATE_SNAPSHOT")
 	}
 	if !c.resumeEventsComplete {
@@ -513,6 +527,7 @@ func (c *Client) handleResumeStateSnapshotLocked(frame Envelope) ([]Action, erro
 	c.replayBytes = 0
 	c.resumeStateNamespaces = nil
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	c.state = StateReady
 	actions = append(actions, SessionReadyAction{SessionID: c.sessionID})
 	return actions, nil
@@ -522,8 +537,8 @@ func (c *Client) handleStateUpdateLocked(frame Envelope) ([]Action, error) {
 	if c.state != StateReady {
 		return nil, ErrInvalidState
 	}
-	if !c.capabilities.Enabled(CapabilityStateSync) {
-		return nil, NewProtocolError(ErrorProtocolViolation, "STATE_UPDATE requires state-sync capability")
+	if !stateSyncEnabled(c.capabilities) {
+		return nil, NewProtocolError(ErrorProtocolViolation, "STATE_UPDATE requires state-sync capability version 1")
 	}
 	var payload StateUpdatePayload
 	if err := decodePayload(frame.Payload, &payload, c.config.StrictValidation); err != nil {
@@ -610,6 +625,7 @@ func (c *Client) handleWelcomeLocked(frame Envelope) ([]Action, error) {
 		c.replayBuffer = nil
 		c.replayBytes = 0
 		c.resumeEventsComplete = c.replayTo == c.lastSeq
+		c.gapResume = false
 		if c.replayTo-c.lastSeq > c.config.MaxReplayEvents {
 			return c.stopReplayLocked("replay exceeds configured event limit"), nil
 		}
@@ -676,6 +692,12 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 	}
 	if c.state == StateResuming {
 		if c.replayTo == 0 {
+			if c.gapResume {
+				// EVENTs already in flight on the connection that exposed the Gap
+				// are superseded by the fixed Replay requested from lastSeq. They
+				// must not advance sequence or reach the Application.
+				return nil, nil
+			}
 			return nil, NewProtocolError(ErrorProtocolViolation, "EVENT arrived before RESUMED WELCOME")
 		}
 		expected := c.lastSeq + uint64(len(c.replayBuffer)) + 1
@@ -705,6 +727,7 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 		c.replayTo = 0
 		c.replayBytes = 0
 		c.resumeEventsComplete = false
+		c.gapResume = false
 		c.state = StateReady
 		actions = append(actions, SessionReadyAction{SessionID: c.sessionID})
 		return actions, nil
@@ -717,6 +740,7 @@ func (c *Client) handleEventLocked(frame Envelope) ([]Action, error) {
 		c.replayBytes = 0
 		c.resumeStateNamespaces = nil
 		c.resumeEventsComplete = false
+		c.gapResume = true
 		return []Action{SendFrameAction{Frame: c.resumeFrameLocked(nil)}}, nil
 	}
 	c.lastSeq = frame.Seq
@@ -743,23 +767,11 @@ func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
 		c.replayBytes = 0
 		c.resumeStateNamespaces = nil
 		c.resumeEventsComplete = false
+		c.gapResume = false
 		actions = append(actions, FullSyncRequiredAction{SessionID: c.sessionID})
 	}
-	if c.state == StateResuming && behavior.AbandonSession {
-		c.state = StateDisconnected
-		c.sessionID = ""
-		c.lastSeq = 0
-		c.eventIDs = make(map[uint64]string)
-		c.outbox = make(map[string]Envelope)
-		c.capabilities = SessionCapabilities{}
-		c.stateObjects = make(map[StateIdentity]StateObject)
-		c.stateBytes = 0
-		c.stateQueries = make(map[string]StateQueryPayload)
-		c.replayBuffer = nil
-		c.replayTo = 0
-		c.replayBytes = 0
-		c.resumeStateNamespaces = nil
-		c.resumeEventsComplete = false
+	if behavior.AbandonSession {
+		c.abandonSessionLocked()
 	}
 	if behavior.CloseConnection {
 		c.state = StateDisconnected
@@ -769,9 +781,30 @@ func (c *Client) handleErrorLocked(frame Envelope) ([]Action, error) {
 		c.replayBytes = 0
 		c.resumeStateNamespaces = nil
 		c.resumeEventsComplete = false
+		c.gapResume = false
 		actions = append(actions, CloseConnectionAction{Reason: payload.Code})
 	}
 	return actions, nil
+}
+
+func (c *Client) abandonSessionLocked() {
+	c.state = StateDisconnected
+	c.sessionID = ""
+	c.lastSeq = 0
+	c.eventIDs = make(map[uint64]string)
+	c.outbox = make(map[string]Envelope)
+	c.pendingPing = nil
+	c.suspectAt = time.Time{}
+	c.capabilities = SessionCapabilities{}
+	c.stateObjects = make(map[StateIdentity]StateObject)
+	c.stateBytes = 0
+	c.stateQueries = make(map[string]StateQueryPayload)
+	c.replayBuffer = nil
+	c.replayTo = 0
+	c.replayBytes = 0
+	c.resumeStateNamespaces = nil
+	c.resumeEventsComplete = false
+	c.gapResume = false
 }
 
 func (c *Client) resumeFrameLocked(namespaces []string) Envelope {
@@ -797,6 +830,7 @@ func (c *Client) stopReplayLocked(reason string) []Action {
 	c.replayBytes = 0
 	c.resumeStateNamespaces = nil
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	return []Action{
 		ProtocolErrorAction{Error: ErrorPayload{Code: ErrorSyncRequired, Message: reason, Retryable: false}},
 		FullSyncRequiredAction{SessionID: c.sessionID},
@@ -812,6 +846,7 @@ func (c *Client) stopStateResumeLocked(reason string) []Action {
 	c.replayBytes = 0
 	c.resumeStateNamespaces = nil
 	c.resumeEventsComplete = false
+	c.gapResume = false
 	return []Action{
 		ProtocolErrorAction{Error: ErrorPayload{Code: ErrorStateSyncRequired, Message: reason, Retryable: false}},
 		CloseConnectionAction{Reason: reason},

@@ -75,6 +75,12 @@ const (
 )
 
 type DedupRecord struct {
-	State DedupState
-	Ack   *Envelope
+	State       DedupState
+	Fingerprint SendFingerprint
+	Ack         *Envelope
 }
+
+// SendFingerprint binds one SEND identity to the exact opaque content bytes
+// originally claimed for it. A retry using the same SEND ID must carry the
+// same fingerprint.
+type SendFingerprint [32]byte

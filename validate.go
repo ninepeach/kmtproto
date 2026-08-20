@@ -143,7 +143,7 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		if p.Mode == WelcomeModeResumed && (!hasResumeFrom || !hasReplayTo || p.ResumeFrom == 0) {
 			return NewProtocolError(ErrorBadRequest, "RESUMED WELCOME requires explicit replay bounds")
 		}
-		if p.Mode == WelcomeModeResumed && p.ReplayTo+1 < p.ResumeFrom {
+		if p.Mode == WelcomeModeResumed && p.ReplayTo < p.ResumeFrom-1 {
 			return NewProtocolError(ErrorBadRequest, "invalid replay bounds")
 		}
 		if p.Mode == WelcomeModeResumed && p.StateSync != nil {
@@ -249,6 +249,13 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		var p ResumePayload
 		if err := decodePayload(e.Payload, &p, strict); err != nil {
 			return err
+		}
+		hasLastSeq, err := jsonFieldPresent(e.Payload, "last_seq")
+		if err != nil {
+			return err
+		}
+		if !hasLastSeq {
+			return NewProtocolError(ErrorBadRequest, "RESUME requires explicit last_seq")
 		}
 		hasStateSync, err := jsonFieldPresent(e.Payload, "state_sync")
 		if err != nil {
@@ -356,6 +363,13 @@ func ValidateFrame(e *Envelope, limits Limits, strict bool) error {
 		}
 		if p.Code == "" || len(p.Message) > limits.MaxErrorMessageLength {
 			return NewProtocolError(ErrorBadRequest, "ERROR requires code and bounded message")
+		}
+		hasRetryable, err := jsonFieldPresent(e.Payload, "retryable")
+		if err != nil {
+			return err
+		}
+		if !hasRetryable {
+			return NewProtocolError(ErrorBadRequest, "ERROR requires explicit retryable")
 		}
 		behavior, known := BehaviorForErrorCode(p.Code)
 		if !known {

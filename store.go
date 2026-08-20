@@ -31,13 +31,24 @@ type StateSnapshotLimits struct {
 }
 
 // ServerSessionStore implementations must be safe for concurrent use.
-// Claim is atomic for (sessionID, msgID). Once it returns claimed=true, no
-// duplicate may claim the same identity until Complete or Abort (or an explicit
-// store-specific crash-recovery procedure) resolves the PROCESSING record.
+// Claim is atomic for (sessionID, msgID) and binds that identity to fingerprint.
+// A returned existing record must preserve the originally claimed fingerprint.
+// Once Claim returns claimed=true, no duplicate may claim the same identity
+// until Complete or Abort (or an explicit store-specific crash-recovery
+// procedure) resolves the PROCESSING record. Completed records must be retained
+// for at least the configured client retry and Session Resume windows.
 type ServerSessionStore interface {
-	Claim(sessionID, msgID string) (claimed bool, existing *DedupRecord, err error)
+	Claim(sessionID, msgID string, fingerprint SendFingerprint) (claimed bool, existing *DedupRecord, err error)
 	Complete(sessionID, msgID string, ack *Envelope) error
 	Abort(sessionID, msgID string) error
+}
+
+// DedupRetentionReporter lets a store expose its completed-record retention so
+// NewServer can verify it against configured retry and Resume windows. Stores
+// that do not implement this interface still MUST satisfy ServerSessionStore's
+// retention contract.
+type DedupRetentionReporter interface {
+	DedupRetentionTTL() time.Duration
 }
 
 // SessionState is protocol metadata retained for one resumable Session.
@@ -59,7 +70,8 @@ func (s SessionState) CapabilityVersion(name string) (uint16, bool) {
 	return s.Capabilities.Version(name)
 }
 
-// SessionRepository implementations must be safe for concurrent use. The
+// SessionRepository implementations must be safe for concurrent use. Create
+// must atomically reject an existing Session ID with ErrSessionExists. The
 // interface describes process-local protocol semantics only; implementations
 // decide their own persistence and distributed-safety guarantees.
 type SessionRepository interface {
@@ -93,13 +105,19 @@ type ReplayStore interface {
 	Replay(sessionID string, afterSeq, throughSeq uint64, limits ReplayLimits) ([]Envelope, error)
 }
 
+// EventAppender atomically appends exactly the requested EVENT and returns its
+// original replayable Envelope. The returned Session ID, event ID, event type,
+// and content must match the request; the sequence must be the next positive
+// Session stream position. Implementations must be safe for concurrent use.
 type EventAppender interface {
 	Append(sessionID, eventID, eventType string, content []byte, timestamp int64) (Envelope, error)
 }
 
 // ApplicationHandler may be called concurrently for different SEND identities.
 // The idempotencyKey is the globally unique SEND ID. Applications that require
-// end-to-end side-effect deduplication must durably honor that key.
+// end-to-end side-effect deduplication must durably honor that key. A returned
+// error is treated as an indeterminate commit and leaves the protocol Claim in
+// PROCESSING; ordinary retries do not execute the Application again.
 type ApplicationHandler interface {
 	HandleSend(ctx context.Context, idempotencyKey string, payload []byte) error
 }
@@ -121,12 +139,22 @@ type MemoryDedupStore struct {
 // store is safe for concurrent use. A PROCESSING claim does not expire: the
 // claim owner must call Complete or Abort. TTL applies after completion.
 func NewMemoryDedupStore(clock Clock, ttl time.Duration) *MemoryDedupStore {
+	if clock == nil {
+		clock = RealClock{}
+	}
 	return &MemoryDedupStore{clock: clock, ttl: ttl, records: make(map[string]memoryDedupEntry)}
+}
+
+func (s *MemoryDedupStore) DedupRetentionTTL() time.Duration {
+	if s == nil {
+		return 0
+	}
+	return s.ttl
 }
 
 func dedupKey(sessionID, msgID string) string { return sessionID + "\x00" + msgID }
 
-func (s *MemoryDedupStore) Claim(sessionID, msgID string) (bool, *DedupRecord, error) {
+func (s *MemoryDedupStore) Claim(sessionID, msgID string, fingerprint SendFingerprint) (bool, *DedupRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := dedupKey(sessionID, msgID)
@@ -141,7 +169,7 @@ func (s *MemoryDedupStore) Claim(sessionID, msgID string) (bool, *DedupRecord, e
 		}
 		delete(s.records, key)
 	}
-	s.records[key] = memoryDedupEntry{record: DedupRecord{State: DedupProcessing}, expiresAt: s.clock.Now().Add(s.ttl)}
+	s.records[key] = memoryDedupEntry{record: DedupRecord{State: DedupProcessing, Fingerprint: fingerprint}, expiresAt: s.clock.Now().Add(s.ttl)}
 	return true, nil, nil
 }
 
@@ -157,7 +185,7 @@ func (s *MemoryDedupStore) Complete(sessionID, msgID string, ack *Envelope) erro
 		return errors.New("kmtproto: message is not claimed")
 	}
 	copyAck := copyEnvelope(*ack)
-	entry.record = DedupRecord{State: DedupCompleted, Ack: &copyAck}
+	entry.record = DedupRecord{State: DedupCompleted, Fingerprint: entry.record.Fingerprint, Ack: &copyAck}
 	entry.expiresAt = s.clock.Now().Add(s.ttl)
 	s.records[key] = entry
 	return nil
@@ -185,11 +213,17 @@ func NewMemorySessionRepository() *MemorySessionRepository {
 	return &MemorySessionRepository{sessions: make(map[string]SessionState)}
 }
 
+var ErrSessionExists = errors.New("kmtproto: session already exists")
+
 func (s *MemorySessionRepository) Create(state SessionState) error {
 	if state.SessionID == "" || state.ExpiresAt.IsZero() {
 		return errors.New("kmtproto: invalid session state")
 	}
 	s.mu.Lock()
+	if _, exists := s.sessions[state.SessionID]; exists {
+		s.mu.Unlock()
+		return ErrSessionExists
+	}
 	s.sessions[state.SessionID] = state
 	s.mu.Unlock()
 	return nil

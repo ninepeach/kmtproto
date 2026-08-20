@@ -1,7 +1,9 @@
 package kmtproto
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,9 +43,8 @@ type ServerConfig struct {
 }
 
 func DefaultServerConfig() ServerConfig {
-	clock := RealClock{}
 	return ServerConfig{
-		Clock:            clock,
+		Clock:            RealClock{},
 		Limits:           DefaultLimits(),
 		SessionResumeTTL: 24 * time.Hour,
 		ReplayTTL:        24 * time.Hour,
@@ -52,8 +53,6 @@ func DefaultServerConfig() ServerConfig {
 		StrictValidation: true,
 		MaxReplayEvents:  DefaultMaxReplayEvents,
 		MaxReplayBytes:   DefaultMaxReplayBytes,
-		NewSessionID:     DefaultSessionIDGenerator(clock),
-		NewFrameID:       DefaultFrameIDGenerator(clock),
 	}
 }
 
@@ -67,6 +66,14 @@ type streamLane struct {
 	running        bool
 	callbackActive bool
 	queue          []streamRequest
+	users          int // guarded by Server.laneMu
+}
+
+type sendFlight struct {
+	done           chan struct{}
+	fingerprint    SendFingerprint
+	callbackActive bool
+	ack            *Envelope
 }
 
 // ErrStreamCallbackActive means a same-Session stream operation was attempted
@@ -87,7 +94,7 @@ type Server struct {
 	app      ApplicationHandler
 
 	flightMu sync.Mutex
-	flights  map[string]chan struct{}
+	flights  map[string]*sendFlight
 	laneMu   sync.Mutex
 	lanes    map[string]*streamLane
 }
@@ -140,7 +147,13 @@ func NewServer(config ServerConfig, sessions SessionRepository, dedup ServerSess
 	if sessions == nil || dedup == nil || replay == nil || appender == nil || app == nil {
 		return nil, errors.New("kmtproto: server dependencies are required")
 	}
-	return &Server{config: config, sessions: sessions, dedup: dedup, replay: replay, appender: appender, app: app, flights: make(map[string]chan struct{}), lanes: make(map[string]*streamLane)}, nil
+	if reporter, ok := dedup.(DedupRetentionReporter); ok {
+		retention := reporter.DedupRetentionTTL()
+		if retention < config.ClientRetryTTL || retention < config.SessionResumeTTL {
+			return nil, errors.New("kmtproto: dedup store retention must cover ClientRetryTTL and SessionResumeTTL")
+		}
+	}
+	return &Server{config: config, sessions: sessions, dedup: dedup, replay: replay, appender: appender, app: app, flights: make(map[string]*sendFlight), lanes: make(map[string]*streamLane)}, nil
 }
 
 func (s *Server) HandleIncoming(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
@@ -171,9 +184,13 @@ func (s *Server) handleIncoming(ctx context.Context, frame Envelope, outbound *O
 	case FrameHello:
 		return s.handleHello(frame, outbound)
 	case FramePing:
-		return serverHandleResult{}, s.handlePing(frame, outbound)
+		result := serverHandleResult{}
+		err := s.handlePing(frame, outbound, &result)
+		return result, err
 	case FrameSend:
-		return serverHandleResult{}, s.handleSend(ctx, frame, outbound)
+		result := serverHandleResult{}
+		err := s.handleSend(ctx, frame, outbound, &result)
+		return result, err
 	case FrameStateQuery:
 		return s.handleStateQuery(ctx, frame, outbound)
 	case FrameResume:
@@ -188,69 +205,85 @@ func (s *Server) handleIncoming(ctx context.Context, frame Envelope, outbound *O
 }
 
 func (s *Server) handleStateQuery(ctx context.Context, frame Envelope, outbound *OutboundQueue) (serverHandleResult, error) {
-	session, exists, err := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
-	if err != nil {
-		return serverHandleResult{}, err
-	}
-	if !exists {
-		return serverHandleResult{abandonSession: true}, s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false)
-	}
-	if !session.CapabilityEnabled(CapabilityStateSync) {
-		return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorProtocolViolation, "STATE_QUERY requires state-sync capability", false)
-	}
-	if s.config.StateStore == nil {
-		return serverHandleResult{}, s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "State store is unavailable", true)
-	}
-	var query StateQueryPayload
-	if err := decodePayload(frame.Payload, &query, s.config.StrictValidation); err != nil {
-		return serverHandleResult{}, err
-	}
-	snapshot := Envelope{
-		V:         WireVersionV2,
-		Type:      FrameStateSnapshot,
-		ID:        frame.ID,
-		SessionID: frame.SessionID,
-		Timestamp: s.config.Clock.Now().UnixMilli(),
-	}
-	snapshotLimits, err := s.stateSnapshotLimits(snapshot)
-	if err != nil {
-		return serverHandleResult{}, err
-	}
-	accumulator, err := newStateSnapshotAccumulator(s.config.Limits, snapshotLimits)
-	if err != nil {
-		return serverHandleResult{}, err
-	}
-	objectIDs := append([]string(nil), query.ObjectIDs...)
-	sortStrings(objectIDs)
-	for _, objectID := range objectIDs {
-		object, found, err := s.config.StateStore.Get(ctx, query.Namespace, objectID)
+	result := serverHandleResult{}
+	err := s.runStream(frame.SessionID, func(lane *streamLane) error {
+		var session SessionState
+		var exists bool
+		if err := lane.invokeCallback(func() error {
+			var lookupErr error
+			session, exists, lookupErr = s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
+			return lookupErr
+		}); err != nil {
+			return err
+		}
+		if !exists {
+			result.abandonSession = true
+			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false)
+		}
+		if !stateSyncEnabled(session.Capabilities) {
+			result.close = true
+			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorProtocolViolation, "STATE_QUERY requires state-sync capability version 1", false)
+		}
+		if s.config.StateStore == nil {
+			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "State store is unavailable", true)
+		}
+		var query StateQueryPayload
+		if err := decodePayload(frame.Payload, &query, s.config.StrictValidation); err != nil {
+			return err
+		}
+		snapshot := Envelope{
+			V:         WireVersionV2,
+			Type:      FrameStateSnapshot,
+			ID:        frame.ID,
+			SessionID: frame.SessionID,
+			Timestamp: s.config.Clock.Now().UnixMilli(),
+		}
+		snapshotLimits, err := s.stateSnapshotLimits(snapshot)
 		if err != nil {
-			return serverHandleResult{}, err
+			return err
 		}
-		if !found {
-			continue
+		accumulator, err := newStateSnapshotAccumulator(s.config.Limits, snapshotLimits)
+		if err != nil {
+			return err
 		}
-		if object.Namespace != query.Namespace || object.ObjectID != objectID {
-			return serverHandleResult{}, errors.New("kmtproto: StateStore returned the wrong object identity")
-		}
-		if err := ValidateStateObject(&object, s.config.Limits); err != nil {
-			return serverHandleResult{}, fmt.Errorf("kmtproto: StateStore returned invalid State: %w", err)
-		}
-		if err := accumulator.Add(object); err != nil {
-			if errors.Is(err, ErrStateSnapshotLimitExceeded) {
-				return serverHandleResult{}, s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+		objectIDs := append([]string(nil), query.ObjectIDs...)
+		sortStrings(objectIDs)
+		for _, objectID := range objectIDs {
+			var object StateObject
+			var found bool
+			if err := lane.invokeCallback(func() error {
+				var getErr error
+				object, found, getErr = s.config.StateStore.Get(ctx, query.Namespace, objectID)
+				return getErr
+			}); err != nil {
+				return err
 			}
-			return serverHandleResult{}, err
+			if !found {
+				continue
+			}
+			if object.Namespace != query.Namespace || object.ObjectID != objectID {
+				return errors.New("kmtproto: StateStore returned the wrong object identity")
+			}
+			if err := ValidateStateObject(&object, s.config.Limits); err != nil {
+				return fmt.Errorf("kmtproto: StateStore returned invalid State: %w", err)
+			}
+			if err := accumulator.Add(object); err != nil {
+				if errors.Is(err, ErrStateSnapshotLimitExceeded) {
+					return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+				}
+				return err
+			}
 		}
-	}
-	snapshot.Payload, err = accumulator.Payload()
-	if err != nil {
-		if errors.Is(err, ErrStateSnapshotLimitExceeded) {
-			return serverHandleResult{}, s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+		snapshot.Payload, err = accumulator.Payload()
+		if err != nil {
+			if errors.Is(err, ErrStateSnapshotLimitExceeded) {
+				return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "State snapshot exceeds configured limit; split the query", false)
+			}
+			return err
 		}
-		return serverHandleResult{}, err
-	}
-	return serverHandleResult{}, s.enqueueFrame(outbound, snapshot)
+		return s.enqueueFrame(outbound, snapshot)
+	})
+	return result, err
 }
 
 func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json.RawMessage, outbound *OutboundQueue) error {
@@ -260,7 +293,8 @@ func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json
 	if len(eventID) > s.config.Limits.MaxIDLength || len(sessionID) > s.config.Limits.MaxSessionIDLength || len(content) > s.config.Limits.MaxPayloadSize {
 		return NewProtocolError(ErrorBadRequest, "event publication exceeds protocol limits")
 	}
-	probe := Envelope{V: WireVersionV2, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: ^uint64(0), Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(EventPayload{EventType: eventType, Content: append([]byte(nil), content...)})}
+	contentCopy := append(json.RawMessage(nil), content...)
+	probe := Envelope{V: WireVersionV2, Type: FrameEvent, ID: eventID, SessionID: sessionID, Seq: ^uint64(0), Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(EventPayload{EventType: eventType, Content: contentCopy})}
 	if err := validateOutboundFrame(&probe, s.config.Limits, s.config.StrictValidation); err != nil {
 		return err
 	}
@@ -280,11 +314,22 @@ func (s *Server) PublishEvent(sessionID, eventID, eventType string, content json
 		var event Envelope
 		err = lane.invokeCallback(func() error {
 			var appendErr error
-			event, appendErr = s.appender.Append(sessionID, eventID, eventType, content, s.config.Clock.Now().UnixMilli())
+			event, appendErr = s.appender.Append(sessionID, eventID, eventType, append([]byte(nil), contentCopy...), s.config.Clock.Now().UnixMilli())
 			return appendErr
 		})
 		if err != nil {
 			return err
+		}
+		if err := validateOutboundFrame(&event, s.config.Limits, s.config.StrictValidation); err != nil {
+			return fmt.Errorf("kmtproto: EventAppender returned invalid EVENT: %w", err)
+		}
+		var payload EventPayload
+		if err := decodePayload(event.Payload, &payload, s.config.StrictValidation); err != nil {
+			return fmt.Errorf("kmtproto: EventAppender returned invalid EVENT payload: %w", err)
+		}
+		if event.Type != FrameEvent || event.SessionID != sessionID || event.ID != eventID ||
+			payload.EventType != eventType || !bytes.Equal(payload.Content, contentCopy) {
+			return errors.New("kmtproto: EventAppender returned an EVENT that does not match the append request")
 		}
 		return s.enqueueFrame(outbound, event)
 	})
@@ -313,8 +358,8 @@ func (s *Server) PublishStateUpdate(sessionID, updateID string, object StateObje
 		if !exists {
 			return NewProtocolError(ErrorInvalidSession, "session expired or unknown")
 		}
-		if !session.CapabilityEnabled(CapabilityStateSync) {
-			return NewProtocolError(ErrorProtocolViolation, "STATE_UPDATE requires state-sync capability")
+		if !stateSyncEnabled(session.Capabilities) {
+			return NewProtocolError(ErrorProtocolViolation, "STATE_UPDATE requires state-sync capability version 1")
 		}
 		frame := Envelope{
 			V:         WireVersionV2,
@@ -355,6 +400,9 @@ func (s *Server) handleHello(frame Envelope, outbound *OutboundQueue) (serverHan
 	}
 	state := SessionState{SessionID: sessionID, ExpiresAt: s.config.Clock.Now().Add(s.config.SessionResumeTTL), Capabilities: accepted}
 	if err := s.sessions.Create(state); err != nil {
+		if errors.Is(err, ErrSessionExists) {
+			return serverHandleResult{}, s.enqueueError(outbound, "", frame.ID, ErrorInternal, "cannot allocate a unique session", true)
+		}
 		return serverHandleResult{}, err
 	}
 	if err := s.enqueueFrame(outbound, welcome); err != nil {
@@ -363,12 +411,13 @@ func (s *Server) handleHello(frame Envelope, outbound *OutboundQueue) (serverHan
 	return serverHandleResult{readySessionID: sessionID, capabilities: accepted}, nil
 }
 
-func (s *Server) handlePing(frame Envelope, outbound *OutboundQueue) error {
+func (s *Server) handlePing(frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
 	_, exists, err := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
 	if err != nil {
 		return err
 	}
 	if !exists {
+		result.abandonSession = true
 		return s.enqueueError(outbound, frame.SessionID, "", ErrorInvalidSession, "session expired or unknown", false)
 	}
 	var ping PingPayload
@@ -379,76 +428,109 @@ func (s *Server) handlePing(frame Envelope, outbound *OutboundQueue) error {
 	return s.enqueueFrame(outbound, pong)
 }
 
-func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *OutboundQueue) error {
-	_, exists, err := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
-	if err != nil {
+func (s *Server) handleSend(ctx context.Context, frame Envelope, outbound *OutboundQueue, result *serverHandleResult) error {
+	var payload SendPayload
+	if err := decodePayload(frame.Payload, &payload, s.config.StrictValidation); err != nil {
+		return err
+	}
+	content := append([]byte(nil), payload.Content...)
+	fingerprint := SendFingerprint(sha256.Sum256(content))
+	key := dedupKey(frame.SessionID, frame.ID)
+	flight, leader, conflict, callbackActive := s.acquireFlight(key, fingerprint)
+	if conflict {
+		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false)
+	}
+	if !leader {
+		if callbackActive {
+			if ack := s.flightACK(flight); ack != nil {
+				if err := s.validateStoredACK(*ack, frame.SessionID, frame.ID); err != nil {
+					return err
+				}
+				return s.enqueueFrame(outbound, *ack)
+			}
+			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND callback is active; retry with the same id", true)
+		}
+		return s.waitForOriginal(ctx, flight, frame, outbound)
+	}
+	defer s.finishFlight(key, flight)
+
+	var exists bool
+	if err := s.invokeSendCallback(key, flight, func() error {
+		_, found, lookupErr := s.sessions.Lookup(frame.SessionID, s.config.Clock.Now())
+		exists = found
+		return lookupErr
+	}); err != nil {
 		return err
 	}
 	if !exists {
+		result.abandonSession = true
 		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInvalidSession, "session expired or unknown", false)
 	}
-	key := dedupKey(frame.SessionID, frame.ID)
-	done, leader := s.acquireFlight(key)
-	if !leader {
-		return s.waitForOriginal(ctx, done, frame, outbound)
-	}
-	defer s.finishFlight(key, done)
 
-	claimed, existing, err := s.dedup.Claim(frame.SessionID, frame.ID)
-	if err != nil {
+	var claimed bool
+	var existing *DedupRecord
+	if err := s.invokeSendCallback(key, flight, func() error {
+		var claimErr error
+		claimed, existing, claimErr = s.dedup.Claim(frame.SessionID, frame.ID, fingerprint)
+		return claimErr
+	}); err != nil {
 		return err
 	}
 	if !claimed {
+		if existing != nil && existing.Fingerprint != fingerprint {
+			return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorBadRequest, "SEND id was reused with different content", false)
+		}
 		if existing != nil && existing.State == DedupCompleted && existing.Ack != nil {
+			if err := s.validateStoredACK(*existing.Ack, frame.SessionID, frame.ID); err != nil {
+				return err
+			}
+			s.setFlightACK(flight, *existing.Ack)
 			return s.enqueueFrame(outbound, *existing.Ack)
 		}
 		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "SEND is still processing; retry with the same id", true)
 	}
 
-	if err := s.inject(FailAfterClaim); err != nil {
+	if err := s.invokeSendCallback(key, flight, func() error { return s.inject(FailAfterClaim) }); err != nil {
 		return err
 	}
-	var payload SendPayload
-	if err := decodePayload(frame.Payload, &payload, s.config.StrictValidation); err != nil {
-		_ = s.dedup.Abort(frame.SessionID, frame.ID)
-		return err
-	}
-	if err := s.app.HandleSend(ctx, frame.ID, append([]byte(nil), payload.Content...)); err != nil {
-		_ = s.dedup.Abort(frame.SessionID, frame.ID)
+	if err := s.invokeSendCallback(key, flight, func() error {
+		return s.app.HandleSend(ctx, frame.ID, append([]byte(nil), content...))
+	}); err != nil {
+		// Application failure may be an indeterminate commit. Leave the Claim in
+		// PROCESSING so elapsed time or an ordinary retry cannot execute it again.
 		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "application rejected SEND", true)
 	}
-	if err := s.inject(FailAfterApplication); err != nil {
+	if err := s.invokeSendCallback(key, flight, func() error { return s.inject(FailAfterApplication) }); err != nil {
 		return err
 	}
 	ack := Envelope{V: WireVersionV2, Type: FrameAck, SessionID: frame.SessionID, Timestamp: s.config.Clock.Now().UnixMilli(), Payload: mustPayload(AckPayload{RefID: frame.ID})}
 	if err := validateOutboundFrame(&ack, s.config.Limits, s.config.StrictValidation); err != nil {
 		return err
 	}
-	if err := s.dedup.Complete(frame.SessionID, frame.ID, &ack); err != nil {
+	if err := s.invokeSendCallback(key, flight, func() error {
+		return s.dedup.Complete(frame.SessionID, frame.ID, &ack)
+	}); err != nil {
 		return err
 	}
-	if err := s.inject(FailAfterComplete); err != nil {
+	s.setFlightACK(flight, ack)
+	if err := s.invokeSendCallback(key, flight, func() error { return s.inject(FailAfterComplete) }); err != nil {
 		return err
 	}
 	return s.enqueueFrame(outbound, ack)
 }
 
-func (s *Server) waitForOriginal(ctx context.Context, done <-chan struct{}, frame Envelope, outbound *OutboundQueue) error {
+func (s *Server) waitForOriginal(ctx context.Context, flight *sendFlight, frame Envelope, outbound *OutboundQueue) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-done:
+	case <-flight.done:
 	}
-	claimed, existing, err := s.dedup.Claim(frame.SessionID, frame.ID)
-	if err != nil {
-		return err
-	}
-	if claimed {
-		_ = s.dedup.Abort(frame.SessionID, frame.ID)
-		return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "original SEND did not complete; retry", true)
-	}
-	if existing != nil && existing.State == DedupCompleted && existing.Ack != nil {
-		return s.enqueueFrame(outbound, *existing.Ack)
+	ack := s.flightACK(flight)
+	if ack != nil {
+		if err := s.validateStoredACK(*ack, frame.SessionID, frame.ID); err != nil {
+			return err
+		}
+		return s.enqueueFrame(outbound, *ack)
 	}
 	return s.enqueueError(outbound, frame.SessionID, frame.ID, ErrorInternal, "original SEND did not complete; retry", true)
 }
@@ -466,8 +548,8 @@ func (s *Server) handleResume(ctx context.Context, frame Envelope, outbound *Out
 		return serverHandleResult{abandonSession: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorInvalidSession, "session expired or unknown", false)
 	}
 	if resume.StateSync != nil {
-		if !state.CapabilityEnabled(CapabilityStateSync) {
-			return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorUnsupportedFeature, "RESUME state_sync capability was not negotiated", false)
+		if !stateSyncEnabled(state.Capabilities) {
+			return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorUnsupportedFeature, "RESUME requires state-sync capability version 1", false)
 		}
 		if s.config.StateSnapshots == nil {
 			return serverHandleResult{close: true}, s.enqueueError(outbound, frame.SessionID, "", ErrorStateUnavailable, "State snapshot provider is unavailable", true)
@@ -684,6 +766,23 @@ func (s *Server) enqueueFrame(outbound *OutboundQueue, frame Envelope) error {
 	return outbound.Enqueue(frame)
 }
 
+func (s *Server) validateStoredACK(ack Envelope, sessionID, messageID string) error {
+	if err := validateOutboundFrame(&ack, s.config.Limits, s.config.StrictValidation); err != nil {
+		return fmt.Errorf("kmtproto: dedup store returned invalid ACK: %w", err)
+	}
+	if ack.Type != FrameAck || ack.SessionID != sessionID {
+		return errors.New("kmtproto: dedup store returned ACK for another SEND")
+	}
+	var payload AckPayload
+	if err := decodePayload(ack.Payload, &payload, s.config.StrictValidation); err != nil {
+		return fmt.Errorf("kmtproto: dedup store returned invalid ACK payload: %w", err)
+	}
+	if payload.RefID != messageID {
+		return errors.New("kmtproto: dedup store returned ACK for another SEND")
+	}
+	return nil
+}
+
 func (s *Server) inject(point string) error {
 	if s.config.FailureInjector == nil {
 		return nil
@@ -691,24 +790,57 @@ func (s *Server) inject(point string) error {
 	return s.config.FailureInjector.Fail(point)
 }
 
-func (s *Server) acquireFlight(key string) (chan struct{}, bool) {
+func (s *Server) acquireFlight(key string, fingerprint SendFingerprint) (flight *sendFlight, leader, conflict, callbackActive bool) {
 	s.flightMu.Lock()
 	defer s.flightMu.Unlock()
-	if done := s.flights[key]; done != nil {
-		return done, false
+	if existing := s.flights[key]; existing != nil {
+		return existing, false, existing.fingerprint != fingerprint, existing.callbackActive
 	}
-	done := make(chan struct{})
-	s.flights[key] = done
-	return done, true
+	flight = &sendFlight{done: make(chan struct{}), fingerprint: fingerprint}
+	s.flights[key] = flight
+	return flight, true, false, false
 }
 
-func (s *Server) finishFlight(key string, done chan struct{}) {
+func (s *Server) finishFlight(key string, flight *sendFlight) {
 	s.flightMu.Lock()
-	if s.flights[key] == done {
+	if s.flights[key] == flight {
 		delete(s.flights, key)
-		close(done)
+		close(flight.done)
 	}
 	s.flightMu.Unlock()
+}
+
+func (s *Server) invokeSendCallback(key string, flight *sendFlight, fn func() error) (err error) {
+	s.flightMu.Lock()
+	if s.flights[key] != flight || flight.callbackActive {
+		s.flightMu.Unlock()
+		return errors.New("kmtproto: SEND flight callback is already active")
+	}
+	flight.callbackActive = true
+	s.flightMu.Unlock()
+	defer func() {
+		s.flightMu.Lock()
+		flight.callbackActive = false
+		s.flightMu.Unlock()
+	}()
+	return fn()
+}
+
+func (s *Server) setFlightACK(flight *sendFlight, ack Envelope) {
+	s.flightMu.Lock()
+	copyACK := copyEnvelope(ack)
+	flight.ack = &copyACK
+	s.flightMu.Unlock()
+}
+
+func (s *Server) flightACK(flight *sendFlight) *Envelope {
+	s.flightMu.Lock()
+	defer s.flightMu.Unlock()
+	if flight.ack == nil {
+		return nil
+	}
+	ack := copyEnvelope(*flight.ack)
+	return &ack
 }
 
 func (s *Server) runStream(sessionID string, fn func(*streamLane) error) error {
@@ -718,8 +850,16 @@ func (s *Server) runStream(sessionID string, fn func(*streamLane) error) error {
 		lane = &streamLane{}
 		s.lanes[sessionID] = lane
 	}
+	lane.users++
 	s.laneMu.Unlock()
-	return lane.run(func() error { return fn(lane) })
+	err := lane.run(func() error { return fn(lane) })
+	s.laneMu.Lock()
+	lane.users--
+	if lane.users == 0 && s.lanes[sessionID] == lane {
+		delete(s.lanes, sessionID)
+	}
+	s.laneMu.Unlock()
+	return err
 }
 
 func (l *streamLane) run(fn func() error) error {
