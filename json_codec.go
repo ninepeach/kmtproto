@@ -3,6 +3,7 @@ package kmtproto
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -40,6 +41,11 @@ func (c *JSONCodec) Decode(data []byte) (*Envelope, error) {
 	if len(data) > c.limits().MaxFrameSize {
 		return nil, NewProtocolError(ErrorBadRequest, "frame exceeds maximum size")
 	}
+	if c.Strict {
+		if err := rejectDuplicateJSONFields(data, "payload"); err != nil {
+			return nil, err
+		}
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if c.Strict {
 		dec.DisallowUnknownFields()
@@ -62,8 +68,13 @@ func (c *JSONCodec) limits() Limits {
 }
 
 func decodePayload(raw json.RawMessage, dst any, strict bool) error {
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return NewProtocolError(ErrorBadRequest, "missing payload")
+	}
+	if strict {
+		if err := rejectDuplicateJSONFields(raw, "content", "data"); err != nil {
+			return err
+		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if strict {
@@ -74,6 +85,84 @@ func decodePayload(raw json.RawMessage, dst any, strict bool) error {
 	}
 	if err := ensureJSONEOF(dec); err != nil {
 		return NewProtocolError(ErrorBadRequest, err.Error())
+	}
+	return nil
+}
+
+func rejectDuplicateJSONFields(raw []byte, opaqueFields ...string) error {
+	opaque := make(map[string]struct{}, len(opaqueFields))
+	for _, field := range opaqueFields {
+		opaque[field] = struct{}{}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := walkStrictJSONValue(decoder, opaque); err != nil {
+		return NewProtocolError(ErrorBadRequest, "invalid JSON object: "+err.Error())
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return NewProtocolError(ErrorBadRequest, err.Error())
+	}
+	return nil
+}
+
+func walkStrictJSONValue(decoder *json.Decoder, opaque map[string]struct{}) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, compound := token.(json.Delim)
+	if !compound {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("object member name is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate object member %q", key)
+			}
+			seen[key] = struct{}{}
+			if _, isOpaque := opaque[key]; isOpaque {
+				var value json.RawMessage
+				if err := decoder.Decode(&value); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := walkStrictJSONValue(decoder, opaque); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("unterminated JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := walkStrictJSONValue(decoder, opaque); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("unterminated JSON array")
+		}
+	default:
+		return errors.New("unexpected JSON delimiter")
 	}
 	return nil
 }

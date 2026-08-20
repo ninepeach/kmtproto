@@ -128,7 +128,9 @@ ERROR disposition.
 ## 7. Reliable SEND and ACK
 
 `(session_id, msg_id)` is the SEND deduplication identity. A retry MUST reuse
-the same ID. The reliable completion order is:
+the same ID and the exact same opaque content bytes. A dedup claim atomically
+binds that identity to a content fingerprint; same-ID/different-content input
+is `BAD_REQUEST`. The reliable completion order is:
 
 ```text
 Claim -> Application(msg_id) -> Complete(stored ACK) -> emit ACK
@@ -139,6 +141,9 @@ ACK and never calls the Application again. A PROCESSING duplicate never calls
 the Application again; it may wait or receive a retryable indeterminate result.
 PROCESSING MUST NOT be reclaimed solely because TTL elapsed. Recovery requires
 Complete, Abort, or an explicit store-specific crash-recovery procedure.
+An Application error is an indeterminate commit unless the Application can
+prove no side effect occurred; ordinary protocol handling therefore leaves the
+claim PROCESSING rather than automatically aborting it.
 
 ACK means the server crossed the reliable protocol completion boundary. It
 does not mean recipient delivery/read, external side-effect completion, final
@@ -159,6 +164,11 @@ retained events are pruned. Within the supported identity retention window,
 - identity older than the verification window: fail conservatively;
 - sequence greater than `last_seq+1`: enter RESUMING, keep `last_seq`, stop
   delivery, and send RESUME.
+
+After a same-connection Gap and before RESUMED WELCOME fixes the Replay
+boundary, additional already-in-flight EVENTs are discarded without delivery
+or sequence advancement. A reconnect-initiated Resume does not permit EVENTs
+before RESUMED WELCOME.
 
 RESUME captures one fixed `replay_to = CurrentSeq(session)`. Replay returns
 exactly `last_seq+1 ... replay_to`, with original ID, sequence, and payload.
@@ -190,6 +200,11 @@ Its STATE_SNAPSHOT response reuses the query ID; missing objects are omitted.
 Point-query results do not promise a cross-object database transaction.
 STATE_UPDATE carries one already-committed complete replacement and does not
 write protocol storage.
+
+Point snapshots and live State output for one Session use the same stream lane.
+If a caller attempts a same-Session stream operation synchronously while an
+injected State callback is active, it receives `ErrStreamCallbackActive` and
+may retry after the callback returns.
 
 Snapshot object count and encoded payload bytes are bounded. Query responses
 accumulate only until the bound and then return deterministic `BAD_REQUEST`.
@@ -243,8 +258,10 @@ Validation occurs before protocol mutation or avoidable large materialization.
 Zero configuration values select defaults; negative values are invalid.
 
 Strict mode rejects unknown Envelope and typed-payload fields. SEND/EVENT
-content and State data remain opaque valid JSON. Codec and validation MUST
-never panic on malformed input.
+content and State data remain opaque valid JSON. Strict mode also rejects
+duplicate member names in the Envelope and typed payload objects; duplicate
+members inside opaque content/data remain an Application concern. Codec and
+validation MUST never panic on malformed input.
 
 ## 14. Concurrency and storage contracts
 
@@ -264,6 +281,13 @@ Replay stores and snapshot providers MUST enforce supplied materialization
 limits. Dedup stores MUST atomically Claim identities. State stores MUST
 atomically enforce monotonic replacement per State identity. Persistence and
 distributed consistency remain implementation concerns.
+
+Session repositories MUST atomically reject duplicate Session IDs. Dedup
+stores MUST retain completed fingerprints and ACKs for at least the configured
+Client retry and Session Resume windows. Clock implementations are
+concurrency-safe, prompt value providers and MUST NOT synchronously call back
+into the protocol object invoking `Now`; this narrow value-provider contract is
+the only operation that may be sampled while a protocol state lock is held.
 
 ## 15. Extension rules
 

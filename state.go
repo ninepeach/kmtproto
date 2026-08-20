@@ -11,8 +11,18 @@ import (
 	"unicode/utf8"
 )
 
-// CapabilityStateSync gates every v0.2 State Synchronization wire frame.
-const CapabilityStateSync = "state-sync"
+const (
+	// CapabilityStateSync gates every v0.2 State Synchronization wire frame.
+	CapabilityStateSync = "state-sync"
+	// CapabilityStateSyncVersion is the exact State Frame semantics implemented
+	// by this wire version. Capability versions are not implicitly compatible.
+	CapabilityStateSyncVersion uint16 = 1
+)
+
+func stateSyncEnabled(capabilities SessionCapabilities) bool {
+	version, enabled := capabilities.Version(CapabilityStateSync)
+	return enabled && version == CapabilityStateSyncVersion
+}
 
 var (
 	ErrStateStale            = errors.New("kmtproto: stale state version")

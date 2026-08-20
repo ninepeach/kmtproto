@@ -85,7 +85,7 @@ type ApplicationHandler interface {
 }
 ```
 
-SEND IDs must be globally unique (ULID is recommended). The protocol store uses `(session_id, msg_id)` for isolation and passes `msg_id` unchanged to the application. The protocol store and application idempotency must work together. If the application commits and the gateway crashes before `Complete`, a retry can cross that window; the application must suppress the repeated side effect using the same key.
+SEND IDs must be globally unique (ULID is recommended). A retry must preserve both the ID and the exact opaque content bytes; the dedup store binds `(session_id, msg_id)` to a content fingerprint and rejects conflicting reuse. The protocol passes `msg_id` unchanged to the application. The protocol store and application idempotency must work together. If the application commits and the gateway crashes before `Complete`, a retry can cross that window; the application must suppress the repeated side effect using the same key.
 
 ## Example
 
