@@ -79,7 +79,7 @@ func TestResumeWithoutStateSyncKeepsExistingEventOnlyBehavior(t *testing.T) {
 		t.Fatalf("plain RESUME changed wire shape: payload=%#v err=%v", resumePayload, err)
 	}
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), resume, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, outbound); err != nil {
 		t.Fatal(err)
 	}
 	welcome := nextTestFrame(t, outbound)
@@ -125,7 +125,7 @@ func TestResumeWithStateGatesDeliveryUntilReplayAndSnapshotComplete(t *testing.T
 	}
 
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), resume, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, outbound); err != nil {
 		t.Fatal(err)
 	}
 	welcome := nextTestFrame(t, outbound)
@@ -232,7 +232,7 @@ func TestResumeStateUnavailableReturnsProtocolErrorBeforeReplay(t *testing.T) {
 	client, _, oldGeneration := readyStateSyncClient(t)
 	generation, resume := reconnectStateClient(t, client, oldGeneration, []string{"message"})
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), resume, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, outbound); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, outbound)
@@ -266,7 +266,7 @@ func TestInterruptedResumeWithStateCanRetryWithoutAdvancingSequence(t *testing.T
 	client, _, initialGeneration := readyStateSyncClient(t)
 	firstGeneration, firstResume := reconnectStateClient(t, client, initialGeneration, []string{"message"})
 	firstOutbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), firstResume, firstOutbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), firstResume, firstOutbound); err != nil {
 		t.Fatal(err)
 	}
 	firstWelcome := nextTestFrame(t, firstOutbound)
@@ -284,7 +284,7 @@ func TestInterruptedResumeWithStateCanRetryWithoutAdvancingSequence(t *testing.T
 		t.Fatalf("old resume snapshot was not generation-fenced: %v", err)
 	}
 	secondOutbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), secondResume, secondOutbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), secondResume, secondOutbound); err != nil {
 		t.Fatal(err)
 	}
 	frames := []Envelope{nextTestFrame(t, secondOutbound), nextTestFrame(t, secondOutbound), nextTestFrame(t, secondOutbound)}
@@ -318,7 +318,7 @@ func TestResumeSnapshotSerializesBeforeConcurrentLiveStateUpdate(t *testing.T) {
 	_, resume := reconnectStateClient(t, client, oldGeneration, []string{"message"})
 	outbound := NewOutboundQueue()
 	resumeDone := make(chan error, 1)
-	go func() { resumeDone <- server.HandleIncoming(context.Background(), resume, outbound) }()
+	go func() { resumeDone <- server.ProcessFrame(context.Background(), resume, outbound) }()
 	<-blocker.started
 
 	updated := state
@@ -371,7 +371,7 @@ func TestResumeSnapshotCallbackReentryFailsWithoutDeadlock(t *testing.T) {
 
 	client, _, oldGeneration := readyStateSyncClient(t)
 	_, resume := reconnectStateClient(t, client, oldGeneration, []string{"message"})
-	if err := server.HandleIncoming(context.Background(), resume, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, outbound); err != nil {
 		t.Fatal(err)
 	}
 	if !errors.Is(provider.result, ErrStreamCallbackActive) {

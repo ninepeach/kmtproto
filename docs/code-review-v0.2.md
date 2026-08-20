@@ -60,14 +60,13 @@ Resolution Record in section 9 for the corrected working tree.
 - State data, SEND content, EVENT content, and event types remain
   application-opaque.
 
-### Boundary clarification needed
+### Boundary clarification resolved
 
-`ServerProtocol.HandleIncoming` does not enforce connection admission state; only
-`ServerAdmission.Handle` does. This is a valid separation, but the public API
-should state unambiguously that callers bypassing `ServerAdmission` MUST
-provide equivalent per-connection admission and serialization. Otherwise a
-caller can invoke repeated HELLO or out-of-state Frames directly against the
-processor.
+`ServerProtocol.ProcessFrame` is explicitly documented as a low-level Frame
+processor that does not enforce connection admission. `ServerAdmission.Handle`
+is the normal transport integration path and owns HELLO-first state, Session
+correlation, allowed-frame checks, and generation fencing. Callers deliberately
+bypassing `ServerAdmission` must provide equivalent admission externally.
 
 ## 3. Correctness findings
 
@@ -164,7 +163,7 @@ that flight to finish (`server.go:436-453`). Unlike `streamLane`, this mechanism
 has no callback-re-entry guard.
 
 If an injected `ServerSessionStore.Claim` or `ApplicationHandler.HandleSend`
-synchronously re-enters `ServerProtocol.HandleIncoming` for the same
+synchronously re-enters `ServerProtocol.ProcessFrame` for the same
 `(session_id,msg_id)`, the nested call sees the existing flight and waits on the
 outer call. The outer callback cannot return until the nested call returns, so
 the flight can never close. With a non-cancelled context this is an unbounded

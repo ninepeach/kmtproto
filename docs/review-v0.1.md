@@ -259,7 +259,7 @@ Migration details:
   existing `ClientConfig` and `ServerConfig` construction continues to work.
 - Callers using `ServerAdmission` must complete HELLO or RESUME before passing
   PING/SEND. Callers that intentionally provide their own admission state may
-  continue to use the lower-level `ServerProtocol.HandleIncoming` frame processor.
+  continue to use the lower-level `ServerProtocol.ProcessFrame` frame processor.
 - RESUMED WELCOME encoders must include both `resume_from` and `replay_to`, even
   when `replay_to` is zero. NEW WELCOME must omit both fields.
 - Only HELLO may carry an optional envelope ID among non-reliable frames. PING,
@@ -288,7 +288,7 @@ honor that key. KMTProto alone does not claim global exactly-once execution.
 | M-2 | Resolved | `BehaviorForErrorCode`; `TestErrorBehaviorAndRetryabilityValidation` |
 | M-3 | Resolved | No permanent lane worker and panic recovery; `TestStreamLaneRecoversFromPanic` |
 | M-4 | Resolved | Complete outbound validation precedes client mutation; `TestOutboundValidationPrecedesClientMutation` |
-| M-5 | Resolved | Invariant and failure-window suite in `hardening_test.go` |
+| M-5 | Resolved | Invariant and failure-window suites in `server_send_test.go`, `client_recovery_test.go`, and `store_contract_test.go` |
 | M-6 | Resolved | `ServerConfig.MaxReplayEvents`; `TestServerReplayEventLimitReturnsSyncRequired` |
 | L-1 | Accepted | Documented compatibility behavior: when replacing `Clock`, set `NewSessionID` explicitly or nil so `NewServerProtocol` derives it from that clock |
 | L-2 | Accepted / Out of Scope | Helper queues/outbox are documented as process-local; replay-specific memory is bounded, while production backpressure and persistence belong to the runtime |

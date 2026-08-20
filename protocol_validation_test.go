@@ -8,19 +8,142 @@ import (
 	"testing"
 )
 
-func requireProtocolErrorCode(t *testing.T, err error, code string) *ProtocolError {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("expected protocol error %s", code)
+func TestRequiredWireFieldsAndDuplicateMembers(t *testing.T) {
+	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s", Payload: json.RawMessage(`{}`)}
+	if err := ValidateFrame(&resume, DefaultLimits(), true); protocolErrorCode(err) != ErrorBadRequest {
+		t.Fatalf("RESUME without last_seq returned %v", err)
 	}
-	var protocolErr *ProtocolError
-	if !errors.As(err, &protocolErr) {
-		t.Fatalf("expected ProtocolError %s, got %T: %v", code, err, err)
+	errorFrame := Envelope{V: WireVersionV2, Type: FrameError, Payload: json.RawMessage(`{"code":"BAD_REQUEST"}`)}
+	if err := ValidateFrame(&errorFrame, DefaultLimits(), true); protocolErrorCode(err) != ErrorBadRequest {
+		t.Fatalf("ERROR without retryable returned %v", err)
 	}
-	if protocolErr.Code != code {
-		t.Fatalf("protocol error code = %s, want %s: %v", protocolErr.Code, code, err)
+	codec := NewJSONCodec()
+	for _, data := range [][]byte{
+		[]byte(`{"v":2,"v":2,"type":"HELLO","payload":{}}`),
+		[]byte(`{"v":2,"type":"RESUME","session_id":"s","payload":{"last_seq":0,"last_seq":1}}`),
+	} {
+		if _, err := codec.Decode(data); protocolErrorCode(err) != ErrorBadRequest {
+			t.Fatalf("duplicate JSON member returned %v for %s", err, data)
+		}
 	}
-	return protocolErr
+}
+
+func TestErrorBehaviorAndRetryabilityValidation(t *testing.T) {
+	cases := []struct {
+		code      string
+		retryable bool
+		close     bool
+		abandon   bool
+		fullSync  bool
+	}{
+		{ErrorBadRequest, false, false, false, false},
+		{ErrorUnsupportedVersion, false, true, false, false},
+		{ErrorUnauthorized, false, true, false, false},
+		{ErrorInvalidSession, false, false, true, false},
+		{ErrorNotFound, false, false, false, false},
+		{ErrorRateLimited, true, false, false, false},
+		{ErrorSyncRequired, false, false, false, true},
+		{ErrorProtocolViolation, false, true, false, false},
+	}
+	for _, tc := range cases {
+		behavior, ok := BehaviorForErrorCode(tc.code)
+		if !ok || behavior.Retryable != tc.retryable || behavior.CloseConnection != tc.close || behavior.AbandonSession != tc.abandon || behavior.FullSyncRequired != tc.fullSync {
+			t.Fatalf("%s behavior=%#v ok=%v", tc.code, behavior, ok)
+		}
+		frame := Envelope{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: tc.code, Retryable: tc.retryable})}
+		if err := ValidateFrame(&frame, DefaultLimits(), true); err != nil {
+			t.Fatalf("%s valid ERROR rejected: %v", tc.code, err)
+		}
+		invalid := copyEnvelope(frame)
+		invalid.Payload = mustPayload(ErrorPayload{Code: tc.code, Retryable: !tc.retryable})
+		if err := ValidateFrame(&invalid, DefaultLimits(), true); err == nil {
+			t.Fatalf("%s conflicting retryability accepted", tc.code)
+		}
+	}
+	internal := Envelope{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorInternal, Retryable: true})}
+	if err := ValidateFrame(&internal, DefaultLimits(), true); err != nil {
+		t.Fatalf("retryable INTERNAL rejected: %v", err)
+	}
+}
+
+func TestV02BaseFrameValidationMatrix(t *testing.T) {
+	valid := []Envelope{
+		{V: WireVersionV2, Type: FrameHello, ID: "optional", Payload: mustPayload(HelloPayload{})},
+		{V: WireVersionV2, Type: FrameWelcome, SessionID: "s", Payload: mustPayload(WelcomePayload{Mode: WelcomeModeNew})},
+		{V: WireVersionV2, Type: FramePing, SessionID: "s", Payload: mustPayload(PingPayload{PingID: "p"})},
+		{V: WireVersionV2, Type: FramePong, SessionID: "s", Payload: mustPayload(PongPayload{PingID: "p"})},
+		{V: WireVersionV2, Type: FrameSend, ID: "m", SessionID: "s", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})},
+		{V: WireVersionV2, Type: FrameAck, SessionID: "s", Payload: mustPayload(AckPayload{RefID: "m"})},
+		{V: WireVersionV2, Type: FrameEvent, ID: "e", SessionID: "s", Seq: 1, Payload: mustPayload(EventPayload{Content: json.RawMessage(`{}`)})},
+		{V: WireVersionV2, Type: FrameResume, SessionID: "s", Payload: mustPayload(ResumePayload{LastSeq: 0})},
+		{V: WireVersionV2, Type: FrameError, Payload: mustPayload(ErrorPayload{Code: ErrorBadRequest, Retryable: false})},
+	}
+	for _, frame := range valid {
+		if err := ValidateFrame(&frame, DefaultLimits(), true); err != nil {
+			t.Fatalf("valid %s rejected: %v", frame.Type, err)
+		}
+	}
+
+	for _, frame := range valid {
+		if frame.Type == FrameEvent {
+			frame.Seq = 0
+		} else {
+			frame.Seq = 1
+		}
+		if err := ValidateFrame(&frame, DefaultLimits(), true); err == nil {
+			t.Fatalf("invalid %s sequence accepted", frame.Type)
+		}
+	}
+
+	for _, index := range []int{1, 2, 3, 5, 7, 8} {
+		frame := valid[index]
+		frame.ID = "forbidden"
+		if err := ValidateFrame(&frame, DefaultLimits(), true); err == nil {
+			t.Fatalf("%s envelope id accepted", frame.Type)
+		}
+	}
+	for _, index := range []int{1, 2, 3, 4, 5, 6, 7} {
+		frame := valid[index]
+		frame.SessionID = ""
+		if err := ValidateFrame(&frame, DefaultLimits(), true); err == nil {
+			t.Fatalf("%s without session accepted", frame.Type)
+		}
+	}
+	unknown := Envelope{V: WireVersionV2, Type: FrameType("FUTURE"), Payload: json.RawMessage(`{}`)}
+	if err := ValidateFrame(&unknown, DefaultLimits(), true); err == nil {
+		t.Fatal("unknown frame type accepted")
+	}
+}
+
+func TestJSONCodecFailureClassesAreDeterministic(t *testing.T) {
+	codec := NewJSONCodec()
+	cases := map[string][]byte{
+		"malformed":           []byte(`{"v":`),
+		"unknown type":        []byte(`{"v":2,"type":"FUTURE","payload":{}}`),
+		"unsupported version": []byte(`{"v":1,"type":"HELLO","payload":{}}`),
+		"missing payload":     []byte(`{"v":2,"type":"HELLO"}`),
+		"trailing value":      []byte(`{"v":2,"type":"HELLO","payload":{}} {}`),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := codec.Decode(data); err == nil {
+				t.Fatal("invalid frame accepted")
+			}
+		})
+	}
+
+	limits := DefaultLimits()
+	limits.MaxIDLength = 4
+	limits.MaxPayloadSize = 16
+	limited := &JSONCodec{Limits: limits, Strict: true}
+	oversizedID := []byte(`{"v":2,"type":"SEND","id":"12345","session_id":"s","payload":{"content":{}}}`)
+	if _, err := limited.Decode(oversizedID); err == nil {
+		t.Fatal("oversized ID accepted")
+	}
+	oversizedPayload := []byte(`{"v":2,"type":"SEND","id":"m","session_id":"s","payload":{"content":"1234567890"}}`)
+	if _, err := limited.Decode(oversizedPayload); err == nil {
+		t.Fatal("oversized payload accepted")
+	}
 }
 
 func TestV02ErrorBehaviorAndPayloadValidation(t *testing.T) {
@@ -82,7 +205,7 @@ func TestInvalidCapabilityReturnsPreciseProtocolError(t *testing.T) {
 
 	server, _, _ := newTestServer(t, &recordingApp{})
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), hello, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), hello, outbound); err != nil {
 		t.Fatal(err)
 	}
 	response := nextTestFrame(t, outbound)
@@ -250,7 +373,7 @@ func TestUnknownFrameServerBehaviorIsDeterministic(t *testing.T) {
 	server, _, _ := newTestServer(t, &recordingApp{})
 	frame := Envelope{V: WireVersionV2, Type: FrameType("FUTURE_FRAME"), ID: "future_1", Payload: json.RawMessage(`{}`)}
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), frame, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), frame, outbound); err != nil {
 		t.Fatal(err)
 	}
 	response := nextTestFrame(t, outbound)

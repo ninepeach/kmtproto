@@ -1012,8 +1012,8 @@ Expected breaking changes:
   ID generation, and State cache/query limits;
 - ServerConfig gains supported capabilities, directional limit policy, and
   Frame ID generation;
-- `ServerProtocol` construction needs State query dependencies without repeatedly
-  lengthening positional arguments;
+- `ServerProtocol` construction groups required collaborators in
+  `ServerDependencies` instead of lengthening positional arguments;
 - SessionRepository evolves from existence checks to protocol Session metadata;
 - `ClientProtocol` gains State query/accessor commands;
 - `ServerProtocol` gains committed State publication;
@@ -1248,7 +1248,8 @@ and Phase 6 generation-fenced Resume.
    Recommendation: each CapabilitySpec declares this; do not persist all
    accepted optional capabilities automatically.
 4. Does the initial `ServerProtocol` constructor move to a ServerDependencies struct?
-   Recommendation: yes, to avoid repeated positional breaking changes.
+   Resolution: yes; v0.2 groups the five required protocol-facing collaborators
+   in `ServerDependencies`.
 
 ### Blocking before Phase 3
 

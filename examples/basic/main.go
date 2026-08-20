@@ -26,7 +26,13 @@ func main() {
 	serverConfig := kmtproto.DefaultServerConfig()
 	serverConfig.Clock = clock
 	serverConfig.NewSessionID = func() (string, error) { return "s_demo", nil }
-	server, mustErr := kmtproto.NewServerProtocol(serverConfig, sessions, dedup, replay, replay, assistantApp{})
+	server, mustErr := kmtproto.NewServerProtocol(serverConfig, kmtproto.ServerDependencies{
+		Sessions:    sessions,
+		Dedup:       dedup,
+		Replay:      replay,
+		Appender:    replay,
+		Application: assistantApp{},
+	})
 	must(mustErr)
 
 	clientConfig := kmtproto.DefaultClientConfig()

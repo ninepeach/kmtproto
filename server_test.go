@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,7 +62,13 @@ func newTestServer(t *testing.T, app ApplicationHandler) (*ServerProtocol, *Fake
 	config.Clock = clock
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	replay := NewMemoryReplayStore()
-	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
+	server, err := NewServerProtocol(config, ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, config.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: app,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +79,7 @@ func createTestSession(t *testing.T, server *ServerProtocol) {
 	t.Helper()
 	out := NewOutboundQueue()
 	hello := Envelope{V: WireVersionV2, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
-	if err := server.HandleIncoming(context.Background(), hello, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), hello, out); err != nil {
 		t.Fatal(err)
 	}
 	if frame := nextTestFrame(t, out); frame.Type != FrameWelcome || frame.SessionID != "s_1" {
@@ -94,14 +101,14 @@ func TestHelloPingAndUnsupportedVersion(t *testing.T) {
 	createTestSession(t, server)
 	out := NewOutboundQueue()
 	ping := Envelope{V: WireVersionV2, Type: FramePing, SessionID: "s_1", Payload: mustPayload(PingPayload{PingID: "p_1", ClientTime: clock.Now().UnixMilli()})}
-	if err := server.HandleIncoming(context.Background(), ping, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), ping, out); err != nil {
 		t.Fatal(err)
 	}
 	if pong := nextTestFrame(t, out); pong.Type != FramePong || pong.Seq != 0 {
 		t.Fatalf("unexpected PONG: %#v", pong)
 	}
 	bad := Envelope{V: 99, Type: FrameHello, Payload: mustPayload(HelloPayload{})}
-	if err := server.HandleIncoming(context.Background(), bad, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), bad, out); err != nil {
 		t.Fatal(err)
 	}
 	if protocolErr := nextTestFrame(t, out); protocolErr.Type != FrameError {
@@ -124,7 +131,7 @@ func TestWireVersionV2IsTheOnlyAcceptedBaseline(t *testing.T) {
 
 	server, _, _ := newTestServer(t, &recordingApp{})
 	outbound := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), v1, outbound); err != nil {
+	if err := server.ProcessFrame(context.Background(), v1, outbound); err != nil {
 		t.Fatal(err)
 	}
 	response := nextTestFrame(t, outbound)
@@ -142,9 +149,9 @@ func TestConcurrentDuplicateSendCommitsOnceAndReplaysAck(t *testing.T) {
 	out1 := NewOutboundQueue()
 	out2 := NewOutboundQueue()
 	errCh := make(chan error, 2)
-	go func() { errCh <- server.HandleIncoming(context.Background(), send, out1) }()
+	go func() { errCh <- server.ProcessFrame(context.Background(), send, out1) }()
 	<-app.started
-	go func() { errCh <- server.HandleIncoming(context.Background(), send, out2) }()
+	go func() { errCh <- server.ProcessFrame(context.Background(), send, out2) }()
 	close(app.release)
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil {
@@ -172,7 +179,7 @@ func TestConcurrentDuplicateSendCommitsOnceAndReplaysAck(t *testing.T) {
 	}
 
 	out3 := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), send, out3); err != nil {
+	if err := server.ProcessFrame(context.Background(), send, out3); err != nil {
 		t.Fatal(err)
 	}
 	if ack3 := nextTestFrame(t, out3); ack3.Timestamp != ack1.Timestamp || string(ack3.Payload) != string(ack1.Payload) {
@@ -190,7 +197,7 @@ func TestResumeBoundaryAndReplayIdentity(t *testing.T) {
 	original := nextTestFrame(t, live)
 	resumeOut := NewOutboundQueue()
 	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
-	if err := server.HandleIncoming(context.Background(), resume, resumeOut); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, resumeOut); err != nil {
 		t.Fatal(err)
 	}
 	welcome := nextTestFrame(t, resumeOut)
@@ -223,7 +230,7 @@ func TestSyncRequiredOutsideReplayWindow(t *testing.T) {
 	}
 	replay.PruneBefore("s_1", 3)
 	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "s_1", Payload: mustPayload(ResumePayload{LastSeq: 0})}
-	if err := server.HandleIncoming(context.Background(), resume, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, out); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, out)
@@ -251,7 +258,7 @@ func TestResumeInvalidSession(t *testing.T) {
 	server, _, _ := newTestServer(t, &recordingApp{})
 	out := NewOutboundQueue()
 	resume := Envelope{V: WireVersionV2, Type: FrameResume, SessionID: "missing", Payload: mustPayload(ResumePayload{LastSeq: 0})}
-	if err := server.HandleIncoming(context.Background(), resume, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), resume, out); err != nil {
 		t.Fatal(err)
 	}
 	frame := nextTestFrame(t, out)
@@ -269,18 +276,24 @@ func TestFailureAfterCompleteRecoversByAckReplay(t *testing.T) {
 	config.NewSessionID = func() (string, error) { return "s_1", nil }
 	config.FailureInjector = failAt(FailAfterComplete)
 	replay := NewMemoryReplayStore()
-	server, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, config.DedupTTL), replay, replay, app)
+	server, err := NewServerProtocol(config, ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, config.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: app,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	createTestSession(t, server)
 	send := Envelope{V: WireVersionV2, Type: FrameSend, ID: "msg_crash", SessionID: "s_1", Payload: mustPayload(SendPayload{Content: json.RawMessage(`{}`)})}
-	if err := server.HandleIncoming(context.Background(), send, NewOutboundQueue()); err == nil {
+	if err := server.ProcessFrame(context.Background(), send, NewOutboundQueue()); err == nil {
 		t.Fatal("expected injected post-complete failure")
 	}
 	server.config.FailureInjector = nil
 	out := NewOutboundQueue()
-	if err := server.HandleIncoming(context.Background(), send, out); err != nil {
+	if err := server.ProcessFrame(context.Background(), send, out); err != nil {
 		t.Fatal(err)
 	}
 	if ack := nextTestFrame(t, out); ack.Type != FrameAck {
@@ -297,14 +310,61 @@ func TestTTLConfigurationInvariant(t *testing.T) {
 	config.SessionResumeTTL = time.Hour
 	clock := NewFakeClock(time.Unix(0, 0))
 	replay := NewMemoryReplayStore()
-	_, err := NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
+	_, err := NewServerProtocol(config, ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, time.Minute),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	})
 	if err == nil {
 		t.Fatal("expected incompatible TTL rejection")
 	}
 
 	config = DefaultServerConfig()
-	_, err = NewServerProtocol(config, NewMemorySessionRepository(), NewMemoryDedupStore(clock, time.Minute), replay, replay, &recordingApp{})
+	_, err = NewServerProtocol(config, ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, time.Minute),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	})
 	if err == nil {
 		t.Fatal("expected short injected dedup retention rejection")
+	}
+}
+
+func TestServerDependenciesAreRequiredDeterministically(t *testing.T) {
+	clock := NewFakeClock(time.Unix(0, 0))
+	config := DefaultServerConfig()
+	config.Clock = clock
+	replay := NewMemoryReplayStore()
+	valid := ServerDependencies{
+		Sessions:    NewMemorySessionRepository(),
+		Dedup:       NewMemoryDedupStore(clock, config.DedupTTL),
+		Replay:      replay,
+		Appender:    replay,
+		Application: &recordingApp{},
+	}
+	tests := []struct {
+		name   string
+		field  string
+		mutate func(*ServerDependencies)
+	}{
+		{name: "Sessions", field: "ServerDependencies.Sessions", mutate: func(deps *ServerDependencies) { deps.Sessions = nil }},
+		{name: "Dedup", field: "ServerDependencies.Dedup", mutate: func(deps *ServerDependencies) { deps.Dedup = nil }},
+		{name: "Replay", field: "ServerDependencies.Replay", mutate: func(deps *ServerDependencies) { deps.Replay = nil }},
+		{name: "Appender", field: "ServerDependencies.Appender", mutate: func(deps *ServerDependencies) { deps.Appender = nil }},
+		{name: "Application", field: "ServerDependencies.Application", mutate: func(deps *ServerDependencies) { deps.Application = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deps := valid
+			test.mutate(&deps)
+			_, err := NewServerProtocol(config, deps)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("missing %s returned %v", test.name, err)
+			}
+		})
 	}
 }

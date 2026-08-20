@@ -42,6 +42,19 @@ Actions. Memory stores, `OutboundQueue`, `SingleWriter`, and
 `ServerAdmission` are process-local reference helpers, not a production
 runtime requirement.
 
+Normal server-side transport integration is:
+
+```text
+caller-owned transport -> ServerAdmission.Handle -> ServerProtocol -> OutboundQueue
+```
+
+`ServerAdmission` owns per-connection protocol admission: HELLO-first state,
+allowed Frame types, Session correlation, and connection-generation fencing.
+`ServerProtocol.ProcessFrame` is a low-level Frame processor and does not
+perform those checks. A caller invoking `ProcessFrame` directly MUST provide
+equivalent admission externally. Neither object owns or opens a network
+connection, and transport lifecycle remains caller-owned.
+
 ## 3. Envelope
 
 ```go
@@ -130,6 +143,12 @@ PING, SEND, STATE_QUERY, and same-session RESUME while READY; and no normal
 traffic while RESUMING. Successful RESUME returns it to READY. A RESUME without
 explicit success leaves that connection closed or abandoned according to the
 ERROR disposition.
+
+`ServerProtocol` is constructed with `ServerDependencies`, which groups the
+required Session repository, dedup store, Replay store, Event appender, and
+Application handler. Missing dependencies are rejected deterministically at
+construction. This grouping is an API boundary only and does not add storage
+or runtime semantics.
 
 ## 7. Reliable SEND and ACK
 
