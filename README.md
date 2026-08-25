@@ -4,7 +4,8 @@ KMTProto is a lightweight, transport-independent protocol core for building reli
 
 It provides resumable logical sessions, idempotent `SEND`/`ACK`, ordered server-to-client `EVENT` streams, gap detection, bounded replay, application-level heartbeat, capability negotiation, generic State synchronization, connection-generation fencing, and strict validation—without coupling the protocol to WebSocket, TCP, QUIC, storage, or business logic.
 
-> Status: `v0.2` is the current freeze candidate and uses Wire Version 2 as its single baseline.
+> Status: the `v0.2` protocol is frozen on Wire Version 2. The implementation
+> is release-ready, but no `v0.2.0` tag has been published yet.
 
 ## What v0.2 guarantees
 
@@ -149,8 +150,8 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 - `capability.go`: capability validation, negotiation, and immutable Session state
 - `state.go`: State Object validation and deterministic version merge
 - `json_codec.go`, `validate.go`, `limits.go`: bounded strict codec and validation
-- `client.go`: generation-fenced client state machine, outbox, heartbeat, and replay delivery
-- `server.go`: handshake, idempotent SEND, replay boundary, and per-session serial lane
+- `client.go`: `ClientProtocol`, including generation fencing, outbox, heartbeat, and replay delivery
+- `server.go`: `ServerProtocol` frame processing plus the reference `ServerAdmission` gate
 - `store.go`: required storage interfaces and deterministic in-memory implementations
 - `outbound.go`: atomic frame batches and single writer
 - `action.go`: transport- and application-facing effects
@@ -160,7 +161,8 @@ GitHub Actions runs the same build, vet, test, race, and bounded fuzz checks.
 `OutboundQueue`, `SingleWriter`, and `ServerAdmission` are reference helpers
 for tests, examples, and simple integrations. They do not make transport,
 backpressure, persistence, or distributed-session policy part of the wire
-protocol. See the [v0.2 final review](docs/review-v0.2-final.md) for the freeze record.
+protocol. See the [v0.2 freeze review](docs/review-v0.2-freeze.md) for the final
+verification record.
 
 ## License
 
