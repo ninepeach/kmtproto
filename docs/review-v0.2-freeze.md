@@ -1,21 +1,26 @@
 # KMTProto v0.2 Freeze Review
 
-Status: **READY TO FREEZE**
+Status: **FREEZE APPROVED**
 
-Review date: 2026-08-20
+Final verification date: 2026-08-20
 
-Reviewed branch: `agent/capability-negotiation-foundation-v0.2`
+Final verified branch: `main`
 
-Reviewed HEAD: `0c3a38951d056228b165ee247c473ddae0baac3e`
+Final verified HEAD: `b185f33ce533a80e326f14ed1fb7981561570713`
 
-Local `main`: `48955c003420542248d54e7c51788908e911396e`
+The original freeze candidate was reviewed on
+`agent/capability-negotiation-foundation-v0.2` at
+`0c3a38951d056228b165ee247c473ddae0baac3e`. Its findings were resolved before
+the final `main` verification. Subsequent changes through `b185f33` clarify the
+public protocol-machine names, strengthen recovery cleanup, and reorganize
+tests without changing Wire Version 2 Frame semantics.
 
-Reviewed candidate: the uncommitted v0.2 working tree on top of that HEAD.
+No `v0.2.0` tag or release is created by this review.
 
 ## 1. Protocol status
 
-KMTProto v0.2 is ready for final human freeze review as a
-transport-independent chat synchronization protocol. The reviewed candidate
+KMTProto v0.2 is approved as a frozen
+transport-independent chat synchronization protocol. The final verified baseline
 has one wire baseline, deterministic capability and connection admission,
 reliable SEND acceptance, one ordered EVENT stream per Session, bounded
 Resume/Replay, application-level heartbeat, and capability-gated generic State
@@ -169,17 +174,18 @@ Existing deterministic coverage includes:
 
 The following non-blocking invariant tests remain useful:
 
-1. define and test an explicit duplicate-JSON-member policy for strict mode;
-2. reject whitespace-padded `null` through direct `ValidateFrame` calls, not
+1. reject whitespace-padded `null` through direct `ValidateFrame` calls, not
    only through normal Codec-decoded wire input;
-3. explicitly prove all-or-nothing Client cache mutation when object N in a
+2. explicitly prove all-or-nothing Client cache mutation when object N in a
    multi-object snapshot fails;
-4. add deterministic concurrent READY State query/response correlation tests;
-5. add exact golden JSON fixtures for the frozen v2 Frame shapes.
+3. add deterministic concurrent READY State query/response correlation tests;
+4. add exact golden JSON fixtures for the frozen v2 Frame shapes.
 
-These are test/strict-input hardening gaps. Inspection and race testing found
-no corresponding Critical or High protocol-state failure in the reviewed Go
-implementation.
+Strict mode now explicitly rejects duplicate members in the Envelope and typed
+protocol payload objects; opaque application JSON remains outside that rule.
+The remaining items are test/fixture hardening gaps. Inspection and race
+testing found no corresponding Critical or High protocol-state failure in the
+reviewed Go implementation.
 
 ## 6. Documentation consistency
 
@@ -209,26 +215,22 @@ Linux AMD64 toolchain. The downloaded archive matched the published SHA-256
 | `go vet ./...` | PASS |
 | `go test ./...` | PASS |
 | `go test -race ./...` | PASS |
-| `go test -run=^$ -fuzz=FuzzJSONCodec -fuzztime=10s .` | PASS; 618,286 executions, 181 new interesting inputs |
+| `go test -run=^$ -fuzz=FuzzJSONCodec -fuzztime=10s .` | PASS; 873,092 executions reported |
 | `go run ./examples/basic` | PASS |
 
 ## 8. Remaining risks
 
-1. Strict mode currently relies on Go JSON decoding behavior for duplicate
-   object member names. This is deterministic within this implementation but
-   should be made explicitly normative before claiming cross-language strict
-   JSON interoperability.
-2. The client outbox, Session/replay memory helpers, State cache, and outbound
+1. The client outbox, Session/replay memory helpers, State cache, and outbound
    helper are process-local; they do not provide process-crash durability or
    production backpressure.
-3. Atomic business consistency between an EVENT and a State replacement is an
+2. Atomic business consistency between an EVENT and a State replacement is an
    Application/storage concern; the protocol intentionally provides no
    cross-model transaction.
-4. `ReplayStore`, `StateStore`, and `StateSnapshotProvider` implementations
+3. `ReplayStore`, `StateStore`, and `StateSnapshotProvider` implementations
    must honor their atomicity, defensive-copy, concurrency, and
    materialization-limit contracts. KMTProto does not make these guarantees
    across multiple processes.
-5. v0.2 intentionally rejects v0.1 wire traffic. Custom `ReplayStore` and
+4. v0.2 intentionally rejects v0.1 wire traffic. Custom `ReplayStore` and
    `StateSnapshotProvider` implementations must adopt the v0.2 limit-bearing
    method signatures.
 
@@ -237,10 +239,9 @@ feature, or protocol redesign.
 
 ## 9. Freeze recommendation
 
-**Yes — KMTProto v0.2 is ready to freeze as a stable protocol version after
-the reviewed working tree is committed and receives final human review.**
+**Yes — KMTProto v0.2 is approved and frozen as a stable protocol version.**
 
-The freeze candidate has:
+The frozen baseline has:
 
 - Critical findings: **0**;
 - High findings: **0**;
@@ -251,6 +252,7 @@ The freeze candidate has:
 - documented concurrency and runtime boundaries;
 - passing vet, unit, race, fuzz, and example validation.
 
-Do not expand the protocol before freeze. The remaining Medium strict-JSON and
-test-fixture items may be resolved as focused hardening work without adding
-features or changing the protocol architecture.
+The protocol freeze does not publish a module release. Release notes, semantic
+version tagging, and GitHub release publication remain separate, explicit
+steps. The remaining test-fixture items may be resolved as focused hardening
+work without adding features or changing the protocol architecture.

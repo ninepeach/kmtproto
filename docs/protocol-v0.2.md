@@ -1,6 +1,6 @@
 # KMTProto Protocol v0.2
 
-Status: **freeze candidate**
+Status: **frozen normative specification (Wire Version 2); tagged release pending**
 
 KMTProto v0.2 is a transport-independent chat synchronization protocol. It
 defines reliable client submissions, an ordered server event stream, bounded
