@@ -9,6 +9,12 @@ generic current-state synchronization. It does not define transports,
 authentication policy, business workflows, databases, distributed ownership,
 or conflict-resolution systems.
 
+This document is the sole authoritative specification for KMTProto v0.2
+protocol semantics. If it conflicts with the README, historical design
+proposals, implementation plans, hardening or review records, examples,
+package documentation, or code comments, this document takes precedence.
+Those other materials are informative and non-normative.
+
 The terms MUST, MUST NOT, SHOULD, and MAY are normative.
 
 ## 1. Wire version and compatibility
